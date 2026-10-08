@@ -2,7 +2,7 @@
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
 // @description     Customizable keyboard shortcuts inspired by KDE on Linux, including same-app window switching with Alt+`, terminal launcher, and window management
-// @version         1.1.0
+// @version         1.1.1
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
@@ -111,7 +111,6 @@ struct HotkeyBinding {
 
     bool Matches(UINT activeModifiers, UINT pressedVk) const {
         if (!valid) return false;
-        // Ignore MOD_NOREPEAT if present
         UINT cleanActiveMods = activeModifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
         UINT cleanTargetMods = modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
         return (cleanTargetMods == cleanActiveMods) && (vk == pressedVk);
@@ -141,14 +140,16 @@ struct AppWindowEntry {
     HICON hIcon = NULL;
 };
 
-// Global switcher state
+// Global state
+static HANDLE g_hHookThread = NULL;
+static DWORD g_dwHookThreadId = 0;
 static HWND g_hHudWnd = NULL;
 static HHOOK g_hKeyboardHook = NULL;
 static DWORD g_targetProcessId = 0;
 static std::vector<AppWindowEntry> g_appWindows;
 static int g_selectedIndex = 0;
 static bool g_hudVisible = false;
-static UINT g_hudTriggerModifier = MOD_ALT; // Modifier required to hold HUD open
+static UINT g_hudTriggerModifier = MOD_ALT;
 
 // Forward declarations
 static bool ParseHotkeyString(const std::wstring& str, HotkeyBinding& out);
@@ -157,6 +158,7 @@ static void ShowHud();
 static void HideHud(bool commitSwitch);
 static void CycleSelection(int direction);
 static void RefreshAppWindows();
+static DWORD WINAPI HookThreadProc(LPVOID lpParam);
 static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 
@@ -201,7 +203,6 @@ static bool ParseHotkeyString(const std::wstring& str, HotkeyBinding& out) {
         } else if (upper == L"WIN" || upper == L"WINDOWS" || upper == L"SUPER" || upper == L"META") {
             mods |= MOD_WIN;
         } else {
-            // Check numeric virtual key code (e.g. "84" or "192")
             bool allDigits = true;
             for (wchar_t c : upper) {
                 if (!iswdigit(c)) { allDigits = false; break; }
@@ -372,6 +373,7 @@ static void CycleSelection(int direction) {
     if (g_appWindows.empty()) return;
     int count = static_cast<int>(g_appWindows.size());
     g_selectedIndex = (g_selectedIndex + direction + count) % count;
+    Wh_Log(L"[CustomShortcuts] Cycling selection: %d of %d", g_selectedIndex + 1, count);
     if (g_hHudWnd) {
         InvalidateRect(g_hHudWnd, NULL, TRUE);
     }
@@ -379,7 +381,11 @@ static void CycleSelection(int direction) {
 
 static void ShowHud() {
     RefreshAppWindows();
+    Wh_Log(L"[CustomShortcuts] Found %d window(s) for target process PID %lu",
+           (int)g_appWindows.size(), g_targetProcessId);
+
     if (g_appWindows.size() <= 1) {
+        Wh_Log(L"[CustomShortcuts] Only 1 window found for this app, nothing to cycle.");
         return;
     }
 
@@ -423,12 +429,16 @@ static void HideHud(bool commitSwitch) {
     if (commitSwitch && !g_appWindows.empty() && g_selectedIndex >= 0 &&
         g_selectedIndex < static_cast<int>(g_appWindows.size())) {
         HWND target = g_appWindows[g_selectedIndex].hWnd;
+        Wh_Log(L"[CustomShortcuts] Switching to window: %p (\"%s\")",
+               target, g_appWindows[g_selectedIndex].title.c_str());
         if (IsWindow(target)) {
             if (IsIconic(target)) {
                 ShowWindow(target, SW_RESTORE);
             }
             SetForegroundWindow(target);
         }
+    } else {
+        Wh_Log(L"[CustomShortcuts] Switch cancelled.");
     }
     g_appWindows.clear();
 }
@@ -542,6 +552,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) activeModifiers |= MOD_SHIFT;
     if (((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) || ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0)) activeModifiers |= MOD_WIN;
 
+    // Log key press if any modifier is active or if it matches special keys
+    if (isKeyDown && activeModifiers != 0) {
+        Wh_Log(L"[CustomShortcuts] Key pressed: vk=0x%02X (%u), active mods: [Win=%d, Alt=%d, Ctrl=%d, Shift=%d]",
+               pKey->vkCode, pKey->vkCode,
+               (activeModifiers & MOD_WIN) != 0,
+               (activeModifiers & MOD_ALT) != 0,
+               (activeModifiers & MOD_CONTROL) != 0,
+               (activeModifiers & MOD_SHIFT) != 0);
+    }
+
     // Track modifier release to commit HUD selection
     if (isKeyUp && g_hudVisible) {
         bool modifierReleased = false;
@@ -554,6 +574,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
 
         if (modifierReleased) {
+            Wh_Log(L"[CustomShortcuts] Modifier released, committing switch.");
             HideHud(true);
             return 1;
         }
@@ -562,10 +583,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // While HUD is visible, handle navigation and cancellation
     if (g_hudVisible && isKeyDown) {
         if (pKey->vkCode == VK_ESCAPE) {
+            Wh_Log(L"[CustomShortcuts] ESC pressed, cancelling switch.");
             HideHud(false);
             return 1;
         }
         if (pKey->vkCode == VK_RETURN || pKey->vkCode == VK_SPACE) {
+            Wh_Log(L"[CustomShortcuts] Enter/Space pressed, committing switch.");
             HideHud(true);
             return 1;
         }
@@ -581,11 +604,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // 1. Same-App Window Switcher
     if (isKeyDown && g_settings.bindingSameApp.valid) {
-        // Check if key matches main key and modifiers match (ignoring Shift for backward cycling)
         UINT modsWithoutShift = activeModifiers & ~MOD_SHIFT;
         UINT targetModsWithoutShift = g_settings.bindingSameApp.modifiers & ~MOD_SHIFT;
 
         if (pKey->vkCode == g_settings.bindingSameApp.vk && modsWithoutShift == targetModsWithoutShift) {
+            Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Same-App Window Switcher! (%s)",
+                   g_settings.bindingSameApp.originalStr.c_str());
             g_hudTriggerModifier = g_settings.bindingSameApp.modifiers ? g_settings.bindingSameApp.modifiers : MOD_ALT;
             if (!g_hudVisible) {
                 ShowHud();
@@ -601,6 +625,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (isKeyDown && !g_settings.terminalPath.empty()) {
         if (g_settings.bindingTerminalWinT.Matches(activeModifiers, pKey->vkCode) ||
             g_settings.bindingTerminalCtrlAltT.Matches(activeModifiers, pKey->vkCode)) {
+            Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Terminal Launcher! Launching: %s",
+                   g_settings.terminalPath.c_str());
             ShellExecuteW(NULL, L"open", g_settings.terminalPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
             return 1;
         }
@@ -608,6 +634,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // 3. Close Active Window
     if (isKeyDown && g_settings.bindingCloseWindow.Matches(activeModifiers, pKey->vkCode)) {
+        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Close Active Window! (%s)",
+               g_settings.bindingCloseWindow.originalStr.c_str());
         HWND hForeground = GetForegroundWindow();
         if (hForeground) {
             PostMessageW(hForeground, WM_CLOSE, 0, 0);
@@ -617,6 +645,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
     // 4. Toggle Fullscreen / Maximize
     if (isKeyDown && g_settings.bindingToggleFullscreen.Matches(activeModifiers, pKey->vkCode)) {
+        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Toggle Fullscreen/Maximize! (%s)",
+               g_settings.bindingToggleFullscreen.originalStr.c_str());
         HWND hForeground = GetForegroundWindow();
         if (hForeground) {
             WINDOWPLACEMENT wp = { sizeof(wp) };
@@ -634,10 +664,75 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // 5. Virtual Desktop Direct Switching: Win + 1..9
     if (g_settings.enableDirectSwitching && isKeyDown && (pKey->vkCode >= '1' && pKey->vkCode <= '9') &&
         (activeModifiers == MOD_WIN)) {
-        Wh_Log(L"Desktop switch requested for desktop: %c", (char)pKey->vkCode);
+        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Virtual Desktop switch: Desktop %c", (char)pKey->vkCode);
     }
 
     return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+// Dedicated background thread running message loop for WH_KEYBOARD_LL
+static DWORD WINAPI HookThreadProc(LPVOID lpParam) {
+    Wh_Log(L"[CustomShortcuts] Hook thread started (ID: %lu)", GetCurrentThreadId());
+
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.lpfnWndProc = HudWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"WindhawkCustomShortcutsHud";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    g_hHudWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        wc.lpszClassName,
+        L"CustomShortcutsHUD",
+        WS_POPUP,
+        0, 0, 460, 200,
+        NULL, NULL, wc.hInstance, NULL
+    );
+
+    g_hKeyboardHook = SetWindowsHookExW(
+        WH_KEYBOARD_LL,
+        LowLevelKeyboardProc,
+        GetModuleHandle(NULL),
+        0
+    );
+
+    if (!g_hKeyboardHook) {
+        g_hKeyboardHook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            LowLevelKeyboardProc,
+            NULL,
+            0
+        );
+    }
+
+    if (!g_hKeyboardHook) {
+        Wh_Log(L"[CustomShortcuts] ERROR: Failed to install WH_KEYBOARD_LL hook (Error %lu)", GetLastError());
+        return 1;
+    }
+
+    Wh_Log(L"[CustomShortcuts] SUCCESS: WH_KEYBOARD_LL hook installed and listening to keyboard events!");
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    Wh_Log(L"[CustomShortcuts] Hook thread message loop terminating...");
+
+    if (g_hKeyboardHook) {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
+    }
+
+    if (g_hHudWnd) {
+        DestroyWindow(g_hHudWnd);
+        g_hHudWnd = NULL;
+    }
+
+    UnregisterClassW(L"WindhawkCustomShortcutsHud", GetModuleHandle(NULL));
+    return 0;
 }
 
 // Load and parse all mod settings
@@ -666,69 +761,58 @@ static void LoadModSettings() {
     g_settings.hudTheme = (theme && *theme) ? theme : L"dark";
 
     g_settings.enableDirectSwitching = Wh_GetIntSetting(L"virtualDesktops.enableDirectSwitching") != 0;
+
+    Wh_Log(L"[CustomShortcuts] Settings loaded:");
+    Wh_Log(L"[CustomShortcuts]   Same-App: '%s' (valid=%d, vk=0x%02X, mods=0x%X)",
+           g_settings.bindingSameApp.originalStr.c_str(), g_settings.bindingSameApp.valid,
+           g_settings.bindingSameApp.vk, g_settings.bindingSameApp.modifiers);
+    Wh_Log(L"[CustomShortcuts]   Terminal 1: '%s' (valid=%d)",
+           g_settings.bindingTerminalWinT.originalStr.c_str(), g_settings.bindingTerminalWinT.valid);
+    Wh_Log(L"[CustomShortcuts]   Terminal 2: '%s' (valid=%d)",
+           g_settings.bindingTerminalCtrlAltT.originalStr.c_str(), g_settings.bindingTerminalCtrlAltT.valid);
+    Wh_Log(L"[CustomShortcuts]   Close Win: '%s' (valid=%d)",
+           g_settings.bindingCloseWindow.originalStr.c_str(), g_settings.bindingCloseWindow.valid);
+    Wh_Log(L"[CustomShortcuts]   Fullscreen: '%s' (valid=%d)",
+           g_settings.bindingToggleFullscreen.originalStr.c_str(), g_settings.bindingToggleFullscreen.valid);
 }
 
 // Windhawk mod initialization
 BOOL Wh_ModInit() {
-    Wh_Log(L"Custom Shortcuts: Wh_ModInit");
+    Wh_Log(L"[CustomShortcuts] Wh_ModInit called");
 
     LoadModSettings();
 
-    // Register HUD window class
-    WNDCLASSEXW wc = { sizeof(wc) };
-    wc.lpfnWndProc = HudWndProc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = L"WindhawkCustomShortcutsHud";
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClassExW(&wc);
-
-    // Create hidden HUD window
-    g_hHudWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName,
-        L"CustomShortcutsHUD",
-        WS_POPUP,
-        0, 0, 460, 200,
-        NULL, NULL, wc.hInstance, NULL
-    );
-
-    // Install low-level keyboard hook
-    g_hKeyboardHook = SetWindowsHookExW(
-        WH_KEYBOARD_LL,
-        LowLevelKeyboardProc,
-        GetModuleHandle(NULL),
-        0
-    );
-
-    if (!g_hKeyboardHook) {
-        Wh_Log(L"Custom Shortcuts: Failed to install low-level keyboard hook (%lu)", GetLastError());
+    // Spawn dedicated thread with message loop for the WH_KEYBOARD_LL hook
+    g_hHookThread = CreateThread(NULL, 0, HookThreadProc, NULL, 0, &g_dwHookThreadId);
+    if (!g_hHookThread) {
+        Wh_Log(L"[CustomShortcuts] ERROR: CreateThread failed (Error %lu)", GetLastError());
         return FALSE;
     }
 
-    Wh_Log(L"Custom Shortcuts: Successfully initialized");
+    Wh_Log(L"[CustomShortcuts] Hook thread created (Thread ID %lu)", g_dwHookThreadId);
     return TRUE;
 }
 
 // Windhawk mod cleanup
 void Wh_ModUninit() {
-    Wh_Log(L"Custom Shortcuts: Wh_ModUninit");
+    Wh_Log(L"[CustomShortcuts] Wh_ModUninit called");
 
-    if (g_hKeyboardHook) {
-        UnhookWindowsHookEx(g_hKeyboardHook);
-        g_hKeyboardHook = NULL;
+    if (g_dwHookThreadId) {
+        PostThreadMessageW(g_dwHookThreadId, WM_QUIT, 0, 0);
+        if (g_hHookThread) {
+            WaitForSingleObject(g_hHookThread, 2000);
+            CloseHandle(g_hHookThread);
+            g_hHookThread = NULL;
+        }
+        g_dwHookThreadId = 0;
     }
 
-    if (g_hHudWnd) {
-        DestroyWindow(g_hHudWnd);
-        g_hHudWnd = NULL;
-    }
-
-    UnregisterClassW(L"WindhawkCustomShortcutsHud", GetModuleHandle(NULL));
+    Wh_Log(L"[CustomShortcuts] Cleanup complete.");
 }
 
 // Settings updated callback
 void Wh_ModSettingsChanged() {
-    Wh_Log(L"Custom Shortcuts: Wh_ModSettingsChanged");
+    Wh_Log(L"[CustomShortcuts] Wh_ModSettingsChanged called");
     LoadModSettings();
     if (g_hHudWnd) {
         InvalidateRect(g_hHudWnd, NULL, TRUE);
