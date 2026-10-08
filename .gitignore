@@ -1,0 +1,15 @@
+# Build artifacts and temporary files
+*.obj
+*.o
+*.dll
+*.so
+*.exe
+*.log
+*.tmp
+
+# IDE / Editor files
+.vscode/
+.vs/
+.idea/
+*.swp
+*~
