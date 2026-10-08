@@ -2,7 +2,7 @@
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
 // @description     Customizable keyboard shortcuts inspired by KDE on Linux, including same-app window switching with Alt+`, terminal launcher, and window management
-// @version         1.1.1
+// @version         1.2.0
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
@@ -141,11 +141,17 @@ struct AppWindowEntry {
 };
 
 // Global state
+#define TIMER_ALT_POLL 101
+
+typedef VOID (WINAPI *SwitchToThisWindow_t)(HWND, BOOL);
+static SwitchToThisWindow_t pfnSwitchToThisWindow = nullptr;
+
 static HANDLE g_hHookThread = NULL;
 static DWORD g_dwHookThreadId = 0;
 static HWND g_hHudWnd = NULL;
 static HHOOK g_hKeyboardHook = NULL;
-static DWORD g_targetProcessId = 0;
+static WCHAR g_targetAppKey[MAX_PATH] = {0};
+static WCHAR g_targetExeName[MAX_PATH] = {0};
 static std::vector<AppWindowEntry> g_appWindows;
 static int g_selectedIndex = 0;
 static bool g_hudVisible = false;
@@ -158,6 +164,7 @@ static void ShowHud();
 static void HideHud(bool commitSwitch);
 static void CycleSelection(int direction);
 static void RefreshAppWindows();
+static void SwitchToAppWindow(HWND hTarget);
 static DWORD WINAPI HookThreadProc(LPVOID lpParam);
 static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
@@ -285,63 +292,231 @@ static bool ParseHotkeyString(const std::wstring& str, HotkeyBinding& out) {
     return false;
 }
 
-// Check if a window is a valid top-level switchable window
+// Helper: check if a window is validly visible on screen
+static bool IsReallyVisible(HWND hWnd) {
+    if (!IsWindow(hWnd)) return false;
+    if (IsIconic(hWnd)) return true; // Minimized windows are valid switch targets!
+    if (!IsWindowVisible(hWnd)) return false;
+    RECT r;
+    GetWindowRect(hWnd, &r);
+    return !IsRectEmpty(&r);
+}
+
+// Helper: check if an ancestor in the owner chain is a tool window
+static bool IsOwnerToolWindow(HWND hWnd) {
+    HWND own = GetWindow(hWnd, GW_OWNER);
+    while (IsWindow(own)) {
+        if (GetWindowLongPtrW(own, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return true;
+        own = GetWindow(own, GW_OWNER);
+    }
+    return false;
+}
+
+// Check if a window is an Alt+Tab eligible top-level window
 static bool IsSwitchableAppWindow(HWND hWnd) {
-    if (!IsWindow(hWnd) || !IsWindowVisible(hWnd)) {
+    if (!IsWindow(hWnd) || hWnd == g_hHudWnd) return false;
+    if (!IsReallyVisible(hWnd)) return false;
+
+    DWORD ex = (DWORD)GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    if (ex & WS_EX_TOOLWINDOW) return false;
+    if ((ex & WS_EX_NOACTIVATE) && !(ex & WS_EX_APPWINDOW)) return false;
+
+    // Standard Alt+Tab owner check: if it has an owner and does not have WS_EX_APPWINDOW,
+    // only list if owner is not tool window and owner is not listable
+    HWND own = GetWindow(hWnd, GW_OWNER);
+    if (!(ex & WS_EX_APPWINDOW) && IsWindow(own) && IsReallyVisible(own) &&
+        !(GetWindowLongPtrW(own, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) &&
+        !IsOwnerToolWindow(own)) {
         return false;
     }
 
-    if (GetWindow(hWnd, GW_OWNER) != NULL) {
-        return false;
-    }
+    if (IsOwnerToolWindow(hWnd)) return false;
 
-    LONG exStyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) {
-        return false;
-    }
-
+    // Check cloaked state (e.g. windows on other virtual desktops or hidden UWP apps)
     int cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) {
         return false;
     }
 
-    WCHAR title[256] = {0};
-    if (GetWindowTextW(hWnd, title, ARRAYSIZE(title)) == 0 || wcslen(title) == 0) {
+    // Exclude Shell and system surfaces
+    WCHAR className[64] = {0};
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+    if (_wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+        _wcsicmp(className, L"Progman") == 0 ||
+        _wcsicmp(className, L"WorkerW") == 0 ||
+        _wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
         return false;
     }
 
     return true;
 }
 
-// Window enumeration callback for matching process ID
-static BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hWnd, &pid);
+// Extract small/clean window icon safely without blocking the hook thread
+static HICON GetWindowAppIcon(HWND hWnd) {
+    HICON hIcon = NULL;
+    SendMessageTimeoutW(hWnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 25, (DWORD_PTR*)&hIcon);
+    if (!hIcon) {
+        SendMessageTimeoutW(hWnd, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, 25, (DWORD_PTR*)&hIcon);
+    }
+    if (!hIcon) {
+        SendMessageTimeoutW(hWnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 25, (DWORD_PTR*)&hIcon);
+    }
+    if (!hIcon) {
+        hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICONSM);
+    }
+    if (!hIcon) {
+        hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICON);
+    }
+    if (!hIcon) {
+        hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+    return hIcon;
+}
 
-    if (pid == g_targetProcessId && IsSwitchableAppWindow(hWnd)) {
+// Callback to locate child CoreWindow inside UWP ApplicationFrameWindow
+static BOOL CALLBACK FindCoreWindowProc(HWND hChild, LPARAM lp) {
+    WCHAR cls[128] = {0};
+    GetClassNameW(hChild, cls, ARRAYSIZE(cls));
+    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+        *(HWND*)lp = hChild;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Identity key used to group windows of the same application across instances and PIDs
+static bool GetWindowAppKey(HWND hWnd, WCHAR* outKey, size_t keyCch, WCHAR* outExeName, size_t exeCch) {
+    if (outKey) outKey[0] = 0;
+    if (outExeName) outExeName[0] = 0;
+    if (!IsWindow(hWnd)) return false;
+
+    DWORD pid = 0;
+    WCHAR className[256] = {0};
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+
+    // For modern / UWP apps, find the hosted core window to identify the actual application process
+    if (_wcsicmp(className, L"ApplicationFrameWindow") == 0) {
+        HWND hCore = NULL;
+        EnumChildWindows(hWnd, FindCoreWindowProc, (LPARAM)&hCore);
+        if (hCore) {
+            GetWindowThreadProcessId(hCore, &pid);
+        }
+    }
+
+    if (!pid) {
+        GetWindowThreadProcessId(hWnd, &pid);
+    }
+    if (!pid) return false;
+
+    // Special case for File Explorer: group folder windows specifically
+    if (_wcsicmp(className, L"CabinetWClass") == 0 || _wcsicmp(className, L"ExploreWClass") == 0) {
+        if (outKey) wcsncpy_s(outKey, keyCch, L"explorer.exe:cabinetwclass", _TRUNCATE);
+        if (outExeName) wcsncpy_s(outExeName, exeCch, L"explorer.exe", _TRUNCATE);
+        return true;
+    }
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        WCHAR exePath[MAX_PATH] = {0};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, exePath, &size)) {
+            LPCWSTR fName = PathFindFileNameW(exePath);
+            if (outExeName && fName) {
+                wcsncpy_s(outExeName, exeCch, fName, _TRUNCATE);
+                for (size_t i = 0; outExeName[i]; ++i) outExeName[i] = (WCHAR)::towlower(outExeName[i]);
+            }
+            if (outKey) {
+                for (DWORD i = 0; i < size; ++i) exePath[i] = (WCHAR)::towlower(exePath[i]);
+                wcsncpy_s(outKey, keyCch, exePath, _TRUNCATE);
+            }
+        }
+        CloseHandle(hProc);
+    }
+
+    if (outKey && !outKey[0]) {
+        swprintf_s(outKey, keyCch, L"pid:%lu", pid);
+    }
+    return true;
+}
+
+// Bring target window to foreground reliably, bypassing Windows foreground lock timeout
+static void SwitchToAppWindow(HWND hTarget) {
+    if (!IsWindow(hTarget)) return;
+
+    HWND hForeground = GetForegroundWindow();
+    if (hForeground == hTarget) return;
+
+    // If target has an active modal or popup window, activate that instead
+    HWND hPopup = GetLastActivePopup(hTarget);
+    HWND hWndToActivate = (IsWindow(hPopup) && IsWindowVisible(hPopup)) ? hPopup : hTarget;
+
+    if (IsIconic(hWndToActivate)) {
+        ShowWindow(hWndToActivate, SW_RESTORE);
+    } else {
+        ShowWindow(hWndToActivate, SW_SHOW);
+    }
+
+    DWORD curThreadId = GetCurrentThreadId();
+    DWORD foreThreadId = hForeground ? GetWindowThreadProcessId(hForeground, NULL) : 0;
+    DWORD targetThreadId = GetWindowThreadProcessId(hWndToActivate, NULL);
+
+    // Attach input queues to inherit foreground activation rights
+    if (foreThreadId && foreThreadId != curThreadId) {
+        AttachThreadInput(curThreadId, foreThreadId, TRUE);
+    }
+    if (targetThreadId && targetThreadId != curThreadId) {
+        AttachThreadInput(curThreadId, targetThreadId, TRUE);
+    }
+
+    // Simulate Alt key tap to unlock foreground lock timeout
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+
+    BringWindowToTop(hWndToActivate);
+    BOOL ok = SetForegroundWindow(hWndToActivate);
+    if (!ok && pfnSwitchToThisWindow) {
+        pfnSwitchToThisWindow(hWndToActivate, TRUE);
+    }
+
+    if (foreThreadId && foreThreadId != curThreadId) {
+        AttachThreadInput(curThreadId, foreThreadId, FALSE);
+    }
+    if (targetThreadId && targetThreadId != curThreadId) {
+        AttachThreadInput(curThreadId, targetThreadId, FALSE);
+    }
+}
+
+// Window enumeration callback for matching current application
+static BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
+    if (hWnd == g_hHudWnd) return TRUE;
+
+    if (!IsSwitchableAppWindow(hWnd)) {
+        return TRUE;
+    }
+
+    WCHAR key[MAX_PATH] = {0};
+    WCHAR exeName[MAX_PATH] = {0};
+    if (!GetWindowAppKey(hWnd, key, ARRAYSIZE(key), exeName, ARRAYSIZE(exeName))) {
+        return TRUE;
+    }
+
+    // Match either full process path or executable name
+    bool matches = (_wcsicmp(key, g_targetAppKey) == 0) ||
+                   (g_targetExeName[0] && exeName[0] && _wcsicmp(exeName, g_targetExeName) == 0);
+
+    if (matches) {
         AppWindowEntry entry;
         entry.hWnd = hWnd;
 
         WCHAR title[256] = {0};
         GetWindowTextW(hWnd, title, ARRAYSIZE(title));
+        if (!title[0]) {
+            LPCWSTR name = exeName[0] ? exeName : PathFindFileNameW(key);
+            wcsncpy_s(title, (name && *name) ? name : L"Window", _TRUNCATE);
+        }
         entry.title = title;
-
-        HICON hIcon = NULL;
-        SendMessageTimeoutW(hWnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, (DWORD_PTR*)&hIcon);
-        if (!hIcon) {
-            SendMessageTimeoutW(hWnd, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, (DWORD_PTR*)&hIcon);
-        }
-        if (!hIcon) {
-            SendMessageTimeoutW(hWnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, (DWORD_PTR*)&hIcon);
-        }
-        if (!hIcon) {
-            hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICONSM);
-        }
-        if (!hIcon) {
-            hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICON);
-        }
-
-        entry.hIcon = hIcon;
+        entry.hIcon = GetWindowAppIcon(hWnd);
         g_appWindows.push_back(entry);
     }
     return TRUE;
@@ -350,13 +525,16 @@ static BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
 static void RefreshAppWindows() {
     g_appWindows.clear();
     HWND hForeground = GetForegroundWindow();
-    if (!hForeground) return;
+    if (!hForeground || hForeground == g_hHudWnd) return;
 
-    GetWindowThreadProcessId(hForeground, &g_targetProcessId);
-    if (!g_targetProcessId) return;
+    if (!GetWindowAppKey(hForeground, g_targetAppKey, ARRAYSIZE(g_targetAppKey),
+                         g_targetExeName, ARRAYSIZE(g_targetExeName))) {
+        return;
+    }
 
     EnumWindows(EnumWindowsProc, 0);
 
+    // Make sure the active window is placed first (MRU index 0)
     for (size_t i = 0; i < g_appWindows.size(); ++i) {
         if (g_appWindows[i].hWnd == hForeground) {
             if (i != 0) {
@@ -381,16 +559,21 @@ static void CycleSelection(int direction) {
 
 static void ShowHud() {
     RefreshAppWindows();
-    Wh_Log(L"[CustomShortcuts] Found %d window(s) for target process PID %lu",
-           (int)g_appWindows.size(), g_targetProcessId);
+    Wh_Log(L"[CustomShortcuts] Found %d window(s) for app key '%s' (%s)",
+           (int)g_appWindows.size(), g_targetAppKey, g_targetExeName);
 
     if (g_appWindows.size() <= 1) {
         Wh_Log(L"[CustomShortcuts] Only 1 window found for this app, nothing to cycle.");
         return;
     }
 
-    g_selectedIndex = 1; // Default to next window in list
+    g_selectedIndex = 1; // Default to the other / next window of the app
     g_hudVisible = true;
+
+    // Start timer to poll for modifier release (ensures switch executes even on quick tap or lost keyup)
+    if (g_hHudWnd) {
+        SetTimer(g_hHudWnd, TIMER_ALT_POLL, 25, NULL);
+    }
 
     if (!g_settings.showHud) {
         return;
@@ -423,6 +606,7 @@ static void HideHud(bool commitSwitch) {
 
     g_hudVisible = false;
     if (g_hHudWnd) {
+        KillTimer(g_hHudWnd, TIMER_ALT_POLL);
         ShowWindow(g_hHudWnd, SW_HIDE);
     }
 
@@ -431,12 +615,7 @@ static void HideHud(bool commitSwitch) {
         HWND target = g_appWindows[g_selectedIndex].hWnd;
         Wh_Log(L"[CustomShortcuts] Switching to window: %p (\"%s\")",
                target, g_appWindows[g_selectedIndex].title.c_str());
-        if (IsWindow(target)) {
-            if (IsIconic(target)) {
-                ShowWindow(target, SW_RESTORE);
-            }
-            SetForegroundWindow(target);
-        }
+        SwitchToAppWindow(target);
     } else {
         Wh_Log(L"[CustomShortcuts] Switch cancelled.");
     }
@@ -528,6 +707,42 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         EndPaint(hWnd, &ps);
         return 0;
     }
+    case WM_TIMER:
+        if (wParam == TIMER_ALT_POLL) {
+            if (g_hudVisible) {
+                bool modifierStillDown = false;
+                if ((g_hudTriggerModifier & MOD_ALT) && ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0)) {
+                    modifierStillDown = true;
+                } else if ((g_hudTriggerModifier & MOD_CONTROL) && ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)) {
+                    modifierStillDown = true;
+                } else if ((g_hudTriggerModifier & MOD_WIN) && (((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) || ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0))) {
+                    modifierStillDown = true;
+                }
+
+                if (!modifierStillDown) {
+                    KillTimer(hWnd, TIMER_ALT_POLL);
+                    Wh_Log(L"[CustomShortcuts] Modifier physically released (timer poll), committing switch!");
+                    HideHud(true);
+                }
+            } else {
+                KillTimer(hWnd, TIMER_ALT_POLL);
+            }
+            return 0;
+        }
+        break;
+    case WM_LBUTTONDOWN: {
+        int y = HIWORD(lParam);
+        int startY = 32;
+        int itemHeight = 40;
+        if (y >= startY) {
+            int clickedIdx = (y - startY) / itemHeight;
+            if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_appWindows.size())) {
+                g_selectedIndex = clickedIdx;
+                HideHud(true);
+            }
+        }
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     default:
@@ -600,6 +815,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             CycleSelection(1);
             return 1;
         }
+        if (pKey->vkCode == VK_TAB) {
+            bool isShift = (activeModifiers & MOD_SHIFT) != 0;
+            CycleSelection(isShift ? -1 : 1);
+            return 1;
+        }
     }
 
     // 1. Same-App Window Switcher
@@ -627,7 +847,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             g_settings.bindingTerminalCtrlAltT.Matches(activeModifiers, pKey->vkCode)) {
             Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Terminal Launcher! Launching: %s",
                    g_settings.terminalPath.c_str());
-            ShellExecuteW(NULL, L"open", g_settings.terminalPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            HINSTANCE hRes = ShellExecuteW(NULL, L"open", g_settings.terminalPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)hRes <= 32 && _wcsicmp(g_settings.terminalPath.c_str(), L"wt.exe") == 0) {
+                WCHAR localAppData[MAX_PATH] = {0};
+                if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
+                    std::wstring fullWt = std::wstring(localAppData) + L"\\Microsoft\\WindowsApps\\wt.exe";
+                    ShellExecuteW(NULL, L"open", fullWt.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                }
+            }
             return 1;
         }
     }
@@ -779,6 +1006,11 @@ static void LoadModSettings() {
 // Windhawk mod initialization
 BOOL Wh_ModInit() {
     Wh_Log(L"[CustomShortcuts] Wh_ModInit called");
+
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        pfnSwitchToThisWindow = (SwitchToThisWindow_t)GetProcAddress(hUser32, "SwitchToThisWindow");
+    }
 
     LoadModSettings();
 
