@@ -51,22 +51,27 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
 
 // ==WindhawkModSettings==
 /*
-- customApps:
-  - shortcut: "Win+Enter"
-    target: "cmd.exe"
-    arguments: ""
-  $name: Custom Application Shortcuts
-  $description: >-
-    Define custom key combinations to launch any application or command (e.g. Win+Enter -> cmd.exe).
 - shortcuts:
     - hotkeySameApp: "Alt+`"
       $name: Same-App Window Switcher
       $description: >-
         Key combination to cycle windows of the active application (e.g. Alt+`, Alt+Tab, Win+`). Leave empty to disable.
+    - hotkeyCustomApp1: "Win+Enter"
+      $name: Custom App 1 Shortcut
+      $description: >-
+        Key combination to launch Custom Application 1 (e.g. Win+Enter). Leave empty to disable.
+    - hotkeyCustomApp2: ""
+      $name: Custom App 2 Shortcut
+      $description: >-
+        Key combination to launch Custom Application 2. Leave empty to disable.
+    - hotkeyCustomApp3: ""
+      $name: Custom App 3 Shortcut
+      $description: >-
+        Key combination to launch Custom Application 3. Leave empty to disable.
     - hotkeyTerminalWinT: "Win+T"
       $name: Terminal Shortcut (Primary)
       $description: >-
-        Key combination to launch terminal (e.g. Win+T, Win+Enter). Leave empty to disable.
+        Key combination to launch terminal (e.g. Win+T). Leave empty to disable.
     - hotkeyTerminalCtrlAltT: "Ctrl+Alt+T"
       $name: Terminal Shortcut (Secondary)
       $description: >-
@@ -79,6 +84,25 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
       $name: Toggle Fullscreen / Maximize
       $description: >-
         Key combination to toggle fullscreen / maximize (e.g. Win+F, F11, Alt+Enter). Leave empty to disable.
+- customAppOptions:
+    - customAppPath1: "cmd.exe"
+      $name: Custom App 1 Executable
+      $description: Path or executable to launch with Custom App 1 Shortcut (e.g. cmd.exe, powershell.exe).
+    - customAppArgs1: ""
+      $name: Custom App 1 Arguments
+      $description: Optional command line arguments for Custom Application 1.
+    - customAppPath2: ""
+      $name: Custom App 2 Executable
+      $description: Path or executable to launch with Custom App 2 Shortcut.
+    - customAppArgs2: ""
+      $name: Custom App 2 Arguments
+      $description: Optional command line arguments for Custom Application 2.
+    - customAppPath3: ""
+      $name: Custom App 3 Executable
+      $description: Path or executable to launch with Custom App 3 Shortcut.
+    - customAppArgs3: ""
+      $name: Custom App 3 Arguments
+      $description: Optional command line arguments for Custom Application 3.
 - terminalOptions:
     - terminalPath: "wt.exe"
       $name: Terminal Executable Path
@@ -1231,41 +1255,42 @@ static void LoadModSettings() {
 
     g_settings.enableDirectSwitching = Wh_GetIntSetting(L"virtualDesktops.enableDirectSwitching") != 0;
 
-    // Load custom application shortcuts array
+    // Load custom application shortcuts
     g_settings.customApps.clear();
-    for (int i = 0;; ++i) {
-        PCWSTR shortcutStr = Wh_GetStringSetting(L"customApps[%d].shortcut", i);
-        if (!shortcutStr || *shortcutStr == L'\0') {
-            if (shortcutStr) Wh_FreeStringSetting(shortcutStr);
-            break;
+    for (int i = 1; i <= 3; ++i) {
+        WCHAR keyHotkey[64];
+        WCHAR keyPath[64];
+        WCHAR keyArgs[64];
+        wsprintfW(keyHotkey, L"shortcuts.hotkeyCustomApp%d", i);
+        wsprintfW(keyPath, L"customAppOptions.customAppPath%d", i);
+        wsprintfW(keyArgs, L"customAppOptions.customAppArgs%d", i);
+
+        LPCWSTR hotkeyStr = Wh_GetStringSetting(keyHotkey);
+        if ((!hotkeyStr || !*hotkeyStr) && i == 1) {
+            hotkeyStr = L"Win+Enter";
         }
 
-        PCWSTR targetStr = Wh_GetStringSetting(L"customApps[%d].target", i);
-        PCWSTR argsStr = Wh_GetStringSetting(L"customApps[%d].arguments", i);
-
-        CustomAppShortcut app;
-        ParseHotkeyString(shortcutStr, app.binding);
-        if (targetStr && *targetStr) app.target = targetStr;
-        if (argsStr && *argsStr) app.arguments = argsStr;
-
-        if (app.binding.valid && !app.target.empty()) {
-            g_settings.customApps.push_back(app);
-            Wh_Log(L"[CustomShortcuts]   Custom App %d: '%s' -> '%s' (args: '%s')",
-                   i, app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+        LPCWSTR pathStr = Wh_GetStringSetting(keyPath);
+        if ((!pathStr || !*pathStr) && i == 1) {
+            pathStr = L"cmd.exe";
         }
 
-        Wh_FreeStringSetting(shortcutStr);
-        if (targetStr) Wh_FreeStringSetting(targetStr);
-        if (argsStr) Wh_FreeStringSetting(argsStr);
-    }
+        LPCWSTR argsStr = Wh_GetStringSetting(keyArgs);
 
-    // Default fallback: if no custom apps configured, provide Win+Enter -> cmd.exe
-    if (g_settings.customApps.empty()) {
-        CustomAppShortcut defaultApp;
-        ParseHotkeyString(L"Win+Enter", defaultApp.binding);
-        defaultApp.target = L"cmd.exe";
-        g_settings.customApps.push_back(defaultApp);
-        Wh_Log(L"[CustomShortcuts]   Default Custom App: 'Win+Enter' -> 'cmd.exe'");
+        if (hotkeyStr && *hotkeyStr && pathStr && *pathStr) {
+            CustomAppShortcut app;
+            ParseHotkeyString(hotkeyStr, app.binding);
+            app.target = pathStr;
+            if (argsStr && *argsStr) {
+                app.arguments = argsStr;
+            }
+
+            if (app.binding.valid && !app.target.empty()) {
+                g_settings.customApps.push_back(app);
+                Wh_Log(L"[CustomShortcuts]   Custom App %d: '%s' -> '%s' (args: '%s')",
+                       i, app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+            }
+        }
     }
 
     Wh_Log(L"[CustomShortcuts] Settings loaded:");
