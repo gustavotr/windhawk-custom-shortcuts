@@ -655,7 +655,7 @@ static void ShowHud() {
 
     // Inner margin inside card around the thumbnail
     int thumbMargin = MulDiv(cardHeight, 4, 100);
-    thumbMargin = std::max(6, std::min(14, thumbMargin));
+    thumbMargin = std::max(12, std::min(28, thumbMargin));
 
     // Thumbnail height and aspect ratio matching active monitor work area
     int thumbH = cardHeight - footerHeight - (thumbMargin * 2);
@@ -666,15 +666,16 @@ static void ShowHud() {
     // Card width accommodates thumbnail plus side margins
     int cardWidth = thumbW + (thumbMargin * 2);
 
-    // Spacing between cards and window padding
-    int cardGap = MulDiv(screenW, 1, 100);
-    cardGap = std::max(10, std::min(24, cardGap));
+    // Spacing between cards (generous gap between thumbnails)
+    int cardGap = MulDiv(screenW, 2, 100);
+    cardGap = std::max(24, std::min(52, cardGap));
 
-    int padX = MulDiv(screenW, 12, 1000);
-    padX = std::max(14, std::min(30, padX));
+    // Spacing from the outer window border
+    int padX = MulDiv(screenW, 22, 1000);
+    padX = std::max(28, std::min(60, padX));
 
-    int padY = MulDiv(screenH, 15, 1000);
-    padY = std::max(14, std::min(30, padY));
+    int padY = MulDiv(screenH, 25, 1000);
+    padY = std::max(24, std::min(54, padY));
 
     // Constrain total switcher width to 92% of screen width so cards fit cleanly on screen
     int maxW = MulDiv(screenW, 92, 100);
@@ -688,7 +689,7 @@ static void ShowHud() {
             cardWidth = maxCardW;
             cardHeight = std::max(130, static_cast<int>(cardHeight * scale));
             footerHeight = std::max(24, std::min(54, MulDiv(cardHeight, 18, 100)));
-            thumbMargin = std::max(4, std::min(14, MulDiv(cardHeight, 4, 100)));
+            thumbMargin = std::max(8, std::min(24, MulDiv(cardHeight, 4, 100)));
         }
         totalWidth = padX * 2 + (itemCount * cardWidth) + ((itemCount - 1) * cardGap);
     }
@@ -697,8 +698,8 @@ static void ShowHud() {
     int hudHeight = padY * 2 + cardHeight;
 
     // Update layout metrics for WM_PAINT
-    g_hudLayout.winCornerRadius = std::max(12, std::min(24, MulDiv(cardHeight, 9, 100)));
-    g_hudLayout.cardCornerRadius = std::max(8, std::min(18, MulDiv(cardHeight, 7, 100)));
+    g_hudLayout.winCornerRadius = std::max(16, std::min(30, MulDiv(cardHeight, 8, 100)));
+    g_hudLayout.cardCornerRadius = std::max(12, std::min(22, MulDiv(cardHeight, 6, 100)));
     g_hudLayout.iconSize = std::max(16, std::min(28, MulDiv(footerHeight, 55, 100)));
     g_hudLayout.fontSize = std::max(11, std::min(18, MulDiv(footerHeight, 38, 100)));
     g_hudLayout.thumbMargin = thumbMargin;
