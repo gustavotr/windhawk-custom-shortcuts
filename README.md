@@ -16,7 +16,7 @@ You can freely set or customize the key combination for every single action in t
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. | Custom hotkey (e.g. `Alt+Tab`, `Win+\``, `Alt+\``) |
 | | `Alt + Shift + \`` | Cycle backwards through the same application's windows. | Automatic with Shift |
 | | `Esc` / `Enter` | While holding `Alt`, press `Esc` to cancel or `Enter` to commit the switch. Releasing `Alt` also commits. | Built-in |
-| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). | Configurable shortcut list (e.g. `cmd.exe`, `wsl -- cd ~`) |
+| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). | Configurable shortcut list (e.g. `cmd.exe`, `wsl --cd ~`) |
 | **Virtual Desktops** | `Win + 1 ... 9` | Direct access and navigation across virtual desktops. | Toggle setting |
 
 *Tip: To disable any shortcut, simply clear its text in the settings.*
@@ -77,11 +77,8 @@ Hotkeys can be customized in the settings using standard combinations:
     - hotkeyCustomApp3: ""
 - customAppOptions:
     - customAppPath1: "cmd.exe"
-    - customAppArgs1: ""
     - customAppPath2: ""
-    - customAppArgs2: ""
     - customAppPath3: ""
-    - customAppArgs3: ""
 - hudOptions:
     - showHud: true
     - hudTheme: dark

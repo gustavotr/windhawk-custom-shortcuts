@@ -23,7 +23,7 @@ You can customize the key combination for every single action in the mod setting
 | Action | Default Combination | Description |
 | :--- | :--- | :--- |
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. |
-| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (e.g. `cmd.exe`, `wsl -- cd ~`). |
+| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (e.g. `cmd.exe`, `wsl --cd ~`). |
 | **Virtual Desktop Navigation** | `Win + 1 ... 9` | Direct switching to virtual desktop 1 through 9. |
 
 *To disable any shortcut, simply clear its setting field.*
@@ -66,23 +66,14 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
         Key combination to launch Custom Application 3. Leave empty to disable.
 - customAppOptions:
     - customAppPath1: "cmd.exe"
-      $name: Custom App 1 Executable
-      $description: Path or executable to launch with Custom App 1 Shortcut (e.g. cmd.exe, powershell.exe).
-    - customAppArgs1: ""
-      $name: Custom App 1 Arguments
-      $description: Optional command line arguments for Custom Application 1.
+      $name: Custom App 1 Command
+      $description: Application executable and optional arguments to launch (e.g. cmd.exe, wsl --cd ~).
     - customAppPath2: ""
-      $name: Custom App 2 Executable
-      $description: Path or executable to launch with Custom App 2 Shortcut (e.g. wsl.exe, cmd.exe).
-    - customAppArgs2: ""
-      $name: Custom App 2 Arguments
-      $description: Optional command line arguments for Custom Application 2 (e.g. --cd ~ or -- cd ~).
+      $name: Custom App 2 Command
+      $description: Application executable and optional arguments to launch (e.g. wsl --cd ~, powershell.exe).
     - customAppPath3: ""
-      $name: Custom App 3 Executable
-      $description: Path or executable to launch with Custom App 3 Shortcut.
-    - customAppArgs3: ""
-      $name: Custom App 3 Arguments
-      $description: Optional command line arguments for Custom Application 3.
+      $name: Custom App 3 Command
+      $description: Application executable and optional arguments to launch.
 - hudOptions:
     - showHud: true
       $name: Show HUD preview
@@ -147,8 +138,7 @@ struct HotkeyBinding {
 // Custom application shortcut entry
 struct CustomAppShortcut {
     HotkeyBinding binding;
-    std::wstring target;
-    std::wstring arguments;
+    std::wstring command;
 };
 
 // Mod settings structure
@@ -1002,22 +992,20 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     }
 }
 
-// Helper: launch application or command line cleanly with arguments
-static void LaunchApplication(const std::wstring& target, const std::wstring& arguments) {
-    if (target.empty()) return;
+// Helper: launch application or command line cleanly
+static void LaunchApplication(const std::wstring& commandLine) {
+    if (commandLine.empty()) return;
 
-    std::wstring execPath = target;
-    std::wstring execArgs = arguments;
+    std::wstring execPath = commandLine;
+    std::wstring execArgs;
 
     // Trim whitespace
     while (!execPath.empty() && (execPath.front() == L' ' || execPath.front() == L'\t')) execPath.erase(0, 1);
     while (!execPath.empty() && (execPath.back() == L' ' || execPath.back() == L'\t')) execPath.pop_back();
-    while (!execArgs.empty() && (execArgs.front() == L' ' || execArgs.front() == L'\t')) execArgs.erase(0, 1);
-    while (!execArgs.empty() && (execArgs.back() == L' ' || execArgs.back() == L'\t')) execArgs.pop_back();
 
-    // If arguments are empty and target contains spaces, check if target has command line arguments embedded
-    // (e.g. user typed "wsl -- cd ~" or "\"C:\Tools\app.exe\" --arg" directly into the path field)
-    if (execArgs.empty() && execPath.find(L' ') != std::wstring::npos) {
+    // If command line contains spaces, check if arguments are embedded
+    // (e.g. user typed "wsl --cd ~" or "\"C:\Tools\app.exe\" --arg" directly)
+    if (execPath.find(L' ') != std::wstring::npos) {
         if (GetFileAttributesW(execPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
             if (execPath.front() == L'\"') {
                 size_t closeQuote = execPath.find(L'\"', 1);
@@ -1528,12 +1516,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (isKeyDown) {
         for (const auto& app : g_settings.customApps) {
             if (app.binding.Matches(activeModifiers, pKey->vkCode)) {
-                Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Custom App Launcher! '%s' -> '%s' (args: '%s')",
-                       app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+                Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Custom App Launcher! '%s' -> '%s'",
+                       app.binding.originalStr.c_str(), app.command.c_str());
                 if (activeModifiers & MOD_WIN) {
                     keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
                 }
-                LaunchApplication(app.target, app.arguments);
+                LaunchApplication(app.command);
                 return 1;
             }
         }
@@ -1681,10 +1669,8 @@ static void LoadModSettings() {
     for (int i = 1; i <= 3; ++i) {
         WCHAR keyHotkey[64];
         WCHAR keyPath[64];
-        WCHAR keyArgs[64];
         wsprintfW(keyHotkey, L"shortcuts.hotkeyCustomApp%d", i);
         wsprintfW(keyPath, L"customAppOptions.customAppPath%d", i);
-        wsprintfW(keyArgs, L"customAppOptions.customAppArgs%d", i);
 
         LPCWSTR hotkeyStr = Wh_GetStringSetting(keyHotkey);
         if ((!hotkeyStr || !*hotkeyStr) && i == 1) {
@@ -1696,20 +1682,15 @@ static void LoadModSettings() {
             pathStr = L"cmd.exe";
         }
 
-        LPCWSTR argsStr = Wh_GetStringSetting(keyArgs);
-
         if (hotkeyStr && *hotkeyStr && pathStr && *pathStr) {
             CustomAppShortcut app;
             ParseHotkeyString(hotkeyStr, app.binding);
-            app.target = pathStr;
-            if (argsStr && *argsStr) {
-                app.arguments = argsStr;
-            }
+            app.command = pathStr;
 
-            if (app.binding.valid && !app.target.empty()) {
+            if (app.binding.valid && !app.command.empty()) {
                 g_settings.customApps.push_back(app);
-                Wh_Log(L"[CustomShortcuts]   Custom App %d: '%s' -> '%s' (args: '%s')",
-                       i, app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+                Wh_Log(L"[CustomShortcuts]   Custom App %d: '%s' -> '%s'",
+                       i, app.binding.originalStr.c_str(), app.command.c_str());
             }
         }
     }
