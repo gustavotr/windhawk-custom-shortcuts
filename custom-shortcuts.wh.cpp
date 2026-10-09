@@ -6,7 +6,7 @@
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
-// @compilerOptions -luxtheme -lgdi32 -ldwmapi -lshlwapi -lole32 -lcomctl32
+// @compilerOptions -luxtheme -lgdi32 -ldwmapi -lshlwapi -lole32 -loleaut32 -luuid -lcomctl32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -95,8 +95,23 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
         - light: Light
 - virtualDesktops:
     - enableDirectSwitching: true
-      $name: Enable Win+1..9 for Virtual Desktops
-      $description: Switch directly to virtual desktop 1 through 9.
+      $name: Enable Direct Switching
+      $description: Switch directly to virtual desktop 1 through 9 using number keys.
+    - desktopModifier: "win"
+      $name: Virtual Desktop Modifier
+      $description: >-
+        Modifier key combination combined with number keys 1-9 (e.g. win, alt, ctrl+win). Defaults to win.
+    - windowsVersion: "auto"
+      $name: Windows Version Compatibility
+      $description: >-
+        Windows version compatibility for internal desktop manager APIs. Defaults to auto.
+      $options:
+        - auto: Auto-detect
+        - win10_old: Windows 10 (Build < 20348)
+        - win10_20348: Windows 10 (Build 20348 - 21999)
+        - win11_22000: Windows 11 (Build 22000 - 22482)
+        - win11_22621: Windows 11 (Build 22621/22631/23H2)
+        - win11_26100: Windows 11 (Build 26100+ / 24H2)
 */
 // ==/WindhawkModSettings==
 
@@ -105,6 +120,10 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
 #include <shlwapi.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <initguid.h>
+#include <objbase.h>
+#include <objectarray.h>
+#include <shobjidl.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -141,6 +160,8 @@ struct ModSettings {
     bool showHud = true;
     std::wstring hudTheme = L"dark";
     bool enableDirectSwitching = true;
+    UINT desktopModifier = MOD_WIN;
+    std::wstring windowsVersion = L"auto";
 };
 
 static ModSettings g_settings;
@@ -182,14 +203,20 @@ static int g_selectedIndex = 0;
 static bool g_hudVisible = false;
 static UINT g_hudTriggerModifier = MOD_ALT;
 
+#define WM_USER_SWITCH_DESKTOP (WM_USER + 201)
+#define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
+
 // Forward declarations
 static bool ParseHotkeyString(const std::wstring& str, HotkeyBinding& out);
+static UINT ParseModifierOnlyString(const std::wstring& str);
 static void LoadModSettings();
 static void ShowHud();
 static void HideHud(bool commitSwitch);
 static void CycleSelection(int direction);
 static void RefreshAppWindows();
 static void SwitchToAppWindow(HWND hTarget);
+static bool SwitchToDesktopNumber(int desktopNum);
+static void CleanupVirtualDesktopAPI();
 static DWORD WINAPI HookThreadProc(LPVOID lpParam);
 static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
@@ -315,6 +342,27 @@ static bool ParseHotkeyString(const std::wstring& str, HotkeyBinding& out) {
         return true;
     }
     return false;
+}
+
+// Parse a modifier string like "win", "alt", "ctrl+win", "alt+shift"
+static UINT ParseModifierOnlyString(const std::wstring& str) {
+    if (str.empty()) return MOD_WIN;
+    UINT mods = 0;
+    size_t start = 0;
+    while (start < str.length()) {
+        size_t plusPos = str.find(L'+', start);
+        std::wstring token = (plusPos == std::wstring::npos) ? str.substr(start) : str.substr(start, plusPos - start);
+        while (!token.empty() && (token.front() == L' ' || token.front() == L'\t')) token.erase(0, 1);
+        while (!token.empty() && (token.back() == L' ' || token.back() == L'\t')) token.pop_back();
+        std::transform(token.begin(), token.end(), token.begin(), ::towupper);
+        if (token == L"CTRL" || token == L"CONTROL") mods |= MOD_CONTROL;
+        else if (token == L"ALT" || token == L"MENU") mods |= MOD_ALT;
+        else if (token == L"SHIFT") mods |= MOD_SHIFT;
+        else if (token == L"WIN" || token == L"WINDOWS" || token == L"SUPER" || token == L"META") mods |= MOD_WIN;
+        if (plusPos == std::wstring::npos) break;
+        start = plusPos + 1;
+    }
+    return mods ? mods : MOD_WIN;
 }
 
 // Helper: check if a window is validly visible on screen
@@ -942,6 +990,11 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         }
         return 0;
     }
+    case WM_USER_SWITCH_DESKTOP: {
+        int desktopNum = static_cast<int>(wParam);
+        SwitchToDesktopNumber(desktopNum);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     default:
@@ -1009,6 +1062,375 @@ static void LaunchApplication(const std::wstring& target, const std::wstring& ar
             }
         }
     }
+}
+
+//=============================================================================
+// Virtual Desktop API Implementation (Windows 10 & 11)
+//=============================================================================
+
+static const CLSID CLSID_ImmersiveShell_Val = {
+    0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
+
+static const CLSID CLSID_VirtualDesktopManagerInternal_Val = {
+    0xC5E0CDCA, 0x7B6E, 0x41B2, {0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B}};
+
+static const CLSID CLSID_VirtualDesktopManager_Val = {
+    0xAA509086, 0x5CA9, 0x4C25, {0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8A}};
+
+static const IID IID_IVirtualDesktopManager_Val = {
+    0xA5CD92DA, 0xDAC9, 0x4701, {0x83, 0x1E, 0x69, 0x52, 0x50, 0xDA, 0x0E, 0x58}};
+
+struct VersionIIDs {
+    IID managerInternal;
+    IID virtualDesktop;
+    bool usesHMonitor;
+};
+
+static const VersionIIDs g_versionIIDs[] = {
+    // [0] Windows 10 (Build < 20348)
+    {{0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6}},
+     {0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}},
+     false},
+
+    // [1] Windows 10 (Build 20348 - 21999)
+    {{0x094AFE11, 0x44F2, 0x4BA0, {0x97, 0x6F, 0x29, 0xA9, 0x7E, 0x26, 0x3E, 0xE0}},
+     {0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}},
+     true},
+
+    // [2] Windows 11 (Build 22000 - 22482)
+    {{0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}},
+     {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}},
+     true},
+
+    // [3] Windows 11 (Build 22621/22631/23H2)
+    {{0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}},
+     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
+     false},
+
+    // [4] Windows 11 (Build 26100+ / 24H2)
+    {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
+     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
+     false},
+};
+
+static int g_windowsVersionIndex = 4;
+
+struct IVirtualDesktop : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetId(GUID*) = 0;
+};
+
+struct IVirtualDesktopManagerInternal : public IUnknown {};
+
+static IServiceProvider* g_pServiceProvider = nullptr;
+static IVirtualDesktopManagerInternal* g_pDesktopManagerInternal = nullptr;
+static IVirtualDesktopManager* g_pDesktopManager = nullptr;
+static bool g_bVDInitialized = false;
+
+template <typename T>
+static T GetVTableFunction(void* pInterface, int index) {
+    return reinterpret_cast<T>((*reinterpret_cast<void***>(pInterface))[index]);
+}
+
+static const int VTABLE_GET_CURRENT_DESKTOP = 6;
+static const int VTABLE_GET_DESKTOPS = 7;
+static const int VTABLE_SWITCH_DESKTOP = 9;
+
+static inline bool UsesHMonitorParameter() {
+    return g_versionIIDs[g_windowsVersionIndex].usesHMonitor;
+}
+
+static void CleanupVirtualDesktopAPI() {
+    SAFE_RELEASE(g_pDesktopManager);
+    SAFE_RELEASE(g_pDesktopManagerInternal);
+    SAFE_RELEASE(g_pServiceProvider);
+    g_bVDInitialized = false;
+}
+
+static bool InitializeVirtualDesktopAPI() {
+    if (g_bVDInitialized && g_pDesktopManagerInternal) return true;
+
+    HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell_Val, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
+                                  (void**)&g_pServiceProvider);
+    if (FAILED(hr) || !g_pServiceProvider) {
+        Wh_Log(L"[CustomShortcuts] Failed to create ImmersiveShell: 0x%08X", hr);
+        return false;
+    }
+
+    hr = g_pServiceProvider->QueryService(CLSID_VirtualDesktopManagerInternal_Val,
+                                          g_versionIIDs[g_windowsVersionIndex].managerInternal,
+                                          (void**)&g_pDesktopManagerInternal);
+    if (FAILED(hr) || !g_pDesktopManagerInternal) {
+        Wh_Log(L"[CustomShortcuts] Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
+        CleanupVirtualDesktopAPI();
+        return false;
+    }
+
+    hr = CoCreateInstance(CLSID_VirtualDesktopManager_Val, nullptr, CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager_Val,
+                          (void**)&g_pDesktopManager);
+    if (FAILED(hr)) {
+        Wh_Log(L"[CustomShortcuts] Failed to create VirtualDesktopManager: 0x%08X", hr);
+    }
+
+    g_bVDInitialized = true;
+    Wh_Log(L"[CustomShortcuts] Virtual Desktop API initialized successfully (Version index: %d)", g_windowsVersionIndex);
+    return true;
+}
+
+static bool ReinitializeVirtualDesktopAPI() {
+    CleanupVirtualDesktopAPI();
+    return InitializeVirtualDesktopAPI();
+}
+
+template <typename TResult>
+static HRESULT CallManagerInternal(int vtableIndex, TResult* outResult) {
+    if (!g_pDesktopManagerInternal && !InitializeVirtualDesktopAPI()) return E_FAIL;
+    if (UsesHMonitorParameter()) {
+        auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(
+            g_pDesktopManagerInternal, vtableIndex);
+        HRESULT hr = pfn(g_pDesktopManagerInternal, nullptr, outResult);
+        if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
+            pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(
+                g_pDesktopManagerInternal, vtableIndex);
+            hr = pfn(g_pDesktopManagerInternal, nullptr, outResult);
+        }
+        return hr;
+    } else {
+        auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(
+            g_pDesktopManagerInternal, vtableIndex);
+        HRESULT hr = pfn(g_pDesktopManagerInternal, outResult);
+        if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
+            pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(
+                g_pDesktopManagerInternal, vtableIndex);
+            hr = pfn(g_pDesktopManagerInternal, outResult);
+        }
+        return hr;
+    }
+}
+
+template <typename TArg>
+static HRESULT CallManagerInternalWithArg(int vtableIndex, TArg arg) {
+    if (!g_pDesktopManagerInternal && !InitializeVirtualDesktopAPI()) return E_FAIL;
+    if (UsesHMonitorParameter()) {
+        auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TArg)>(
+            g_pDesktopManagerInternal, vtableIndex);
+        HRESULT hr = pfn(g_pDesktopManagerInternal, nullptr, arg);
+        if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
+            pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TArg)>(
+                g_pDesktopManagerInternal, vtableIndex);
+            hr = pfn(g_pDesktopManagerInternal, nullptr, arg);
+        }
+        return hr;
+    } else {
+        auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TArg)>(
+            g_pDesktopManagerInternal, vtableIndex);
+        HRESULT hr = pfn(g_pDesktopManagerInternal, arg);
+        if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
+            pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TArg)>(
+                g_pDesktopManagerInternal, vtableIndex);
+            hr = pfn(g_pDesktopManagerInternal, arg);
+        }
+        return hr;
+    }
+}
+
+static IObjectArray* GetDesktops() {
+    if (!g_pDesktopManagerInternal) return nullptr;
+    IObjectArray* desktops = nullptr;
+    HRESULT hr = CallManagerInternal(VTABLE_GET_DESKTOPS, &desktops);
+    if (FAILED(hr)) {
+        Wh_Log(L"[CustomShortcuts] GetDesktops failed: 0x%08X", hr);
+        return nullptr;
+    }
+    return desktops;
+}
+
+static bool GetCurrentDesktopId(GUID* outGuid) {
+    if (!g_pDesktopManagerInternal) return false;
+    IVirtualDesktop* desktop = nullptr;
+    HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
+    if (FAILED(hr) || !desktop) {
+        Wh_Log(L"[CustomShortcuts] GetCurrentDesktop failed: 0x%08X", hr);
+        return false;
+    }
+    hr = desktop->GetId(outGuid);
+    desktop->Release();
+    return SUCCEEDED(hr);
+}
+
+static int GetCurrentDesktopIndex() {
+    GUID currentId = {};
+    if (!GetCurrentDesktopId(&currentId)) return -1;
+    IObjectArray* desktops = GetDesktops();
+    if (!desktops) return -1;
+    UINT count = 0;
+    desktops->GetCount(&count);
+    int foundIdx = -1;
+    for (UINT i = 0; i < count; ++i) {
+        IVirtualDesktop* desktop = nullptr;
+        if (SUCCEEDED(desktops->GetAt(i, g_versionIIDs[g_windowsVersionIndex].virtualDesktop, (void**)&desktop)) && desktop) {
+            GUID guid = {};
+            bool match = SUCCEEDED(desktop->GetId(&guid)) && IsEqualGUID(guid, currentId);
+            desktop->Release();
+            if (match) {
+                foundIdx = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    desktops->Release();
+    return foundIdx;
+}
+
+static bool SwitchToDesktop(IVirtualDesktop* desktop) {
+    if (!g_pDesktopManagerInternal || !desktop) return false;
+    HRESULT hr = CallManagerInternalWithArg(VTABLE_SWITCH_DESKTOP, desktop);
+    if (FAILED(hr)) {
+        Wh_Log(L"[CustomShortcuts] SwitchToDesktop COM call failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+static bool IsEligibleFocusWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (!(style & WS_VISIBLE) || (style & WS_CHILD)) return false;
+    if (GetWindowLongPtr(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
+    return GetAncestor(hwnd, GA_ROOTOWNER) == hwnd;
+}
+
+static HWND FindTopWindowOnDesktop(const GUID& desktopId) {
+    if (!g_pDesktopManager) return nullptr;
+    struct EnumContext {
+        GUID targetId;
+        HWND resultHwnd;
+    } context = { desktopId, nullptr };
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+        if (!IsEligibleFocusWindow(hwnd)) return TRUE;
+
+        GUID winDesktopId = {};
+        if (SUCCEEDED(g_pDesktopManager->GetWindowDesktopId(hwnd, &winDesktopId))) {
+            if (IsEqualGUID(winDesktopId, ctx->targetId)) {
+                ctx->resultHwnd = hwnd;
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&context));
+
+    return context.resultHwnd;
+}
+
+static void FocusWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+typedef LONG(NTAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+
+static int DetectWindowsVersionIndex() {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hNtdll, "RtlGetVersion");
+        if (pRtlGetVersion) {
+            RTL_OSVERSIONINFOW rovi = { sizeof(rovi) };
+            if (pRtlGetVersion(&rovi) == 0) {
+                DWORD build = rovi.dwBuildNumber;
+                Wh_Log(L"[CustomShortcuts] Windows Build detected: %lu", build);
+                if (build >= 26100) return 4;
+                if (build >= 22621) return 3;
+                if (build >= 22000) return 2;
+                if (build >= 20348) return 1;
+                return 0;
+            }
+        }
+    }
+    return 4;
+}
+
+static bool SwitchToDesktopNumber(int desktopNum) {
+    if (desktopNum < 1 || desktopNum > 9) return false;
+    if (!InitializeVirtualDesktopAPI()) {
+        Wh_Log(L"[CustomShortcuts] SwitchToDesktopNumber: Failed to initialize Virtual Desktop API");
+        return false;
+    }
+
+    IObjectArray* desktops = GetDesktops();
+    if (!desktops) {
+        Wh_Log(L"[CustomShortcuts] SwitchToDesktopNumber: Failed to get virtual desktops");
+        return false;
+    }
+
+    UINT count = 0;
+    desktops->GetCount(&count);
+    if ((UINT)(desktopNum - 1) >= count) {
+        Wh_Log(L"[CustomShortcuts] Desktop %d requested, but only %u virtual desktops exist", desktopNum, count);
+        desktops->Release();
+        return false;
+    }
+
+    IVirtualDesktop* targetDesktop = nullptr;
+    HRESULT hr = desktops->GetAt(desktopNum - 1, g_versionIIDs[g_windowsVersionIndex].virtualDesktop, (void**)&targetDesktop);
+    desktops->Release();
+
+    if (FAILED(hr) || !targetDesktop) {
+        Wh_Log(L"[CustomShortcuts] Failed to get desktop %d: 0x%08X", desktopNum, hr);
+        return false;
+    }
+
+    GUID currentId = {};
+    GUID targetId = {};
+    if (GetCurrentDesktopId(&currentId) && SUCCEEDED(targetDesktop->GetId(&targetId))) {
+        if (IsEqualGUID(currentId, targetId)) {
+            Wh_Log(L"[CustomShortcuts] Already on Desktop %d", desktopNum);
+            targetDesktop->Release();
+            return true;
+        }
+    }
+
+    HWND windowToFocus = nullptr;
+    if (SUCCEEDED(targetDesktop->GetId(&targetId))) {
+        windowToFocus = FindTopWindowOnDesktop(targetId);
+    }
+
+    bool success = SwitchToDesktop(targetDesktop);
+    targetDesktop->Release();
+
+    if (success) {
+        Wh_Log(L"[CustomShortcuts] Successfully switched to Virtual Desktop %d", desktopNum);
+        if (windowToFocus) {
+            FocusWindow(windowToFocus);
+        }
+    } else {
+        Wh_Log(L"[CustomShortcuts] SwitchToDesktop failed for Desktop %d, trying keyboard fallback...", desktopNum);
+        int curIdx = GetCurrentDesktopIndex();
+        if (curIdx >= 0) {
+            int targetIdx = desktopNum - 1;
+            int diff = targetIdx - curIdx;
+            if (diff != 0) {
+                WORD vkDir = (diff > 0) ? VK_RIGHT : VK_LEFT;
+                int steps = abs(diff);
+                Wh_Log(L"[CustomShortcuts] Keyboard fallback: %d steps (%s)",
+                       steps, (vkDir == VK_RIGHT) ? L"RIGHT" : L"LEFT");
+                for (int i = 0; i < steps; ++i) {
+                    keybd_event(VK_CONTROL, 0, 0, 0);
+                    keybd_event(VK_LWIN, 0, 0, 0);
+                    keybd_event(vkDir, 0, 0, 0);
+                    keybd_event(vkDir, 0, KEYEVENTF_KEYUP, 0);
+                    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+                    Sleep(30);
+                }
+                success = true;
+            }
+        }
+    }
+
+    return success;
 }
 
 // Low-level keyboard hook callback
@@ -1117,10 +1539,24 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
     }
 
-    // 3. Virtual Desktop Direct Switching: Win + 1..9
-    if (g_settings.enableDirectSwitching && isKeyDown && (pKey->vkCode >= '1' && pKey->vkCode <= '9') &&
-        (activeModifiers == MOD_WIN)) {
-        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Virtual Desktop switch: Desktop %c", (char)pKey->vkCode);
+    // 3. Virtual Desktop Direct Switching: <modifier> + 1..9
+    if (g_settings.enableDirectSwitching && (pKey->vkCode >= '1' && pKey->vkCode <= '9')) {
+        UINT cleanMods = activeModifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
+        if (cleanMods == g_settings.desktopModifier) {
+            if (isKeyDown) {
+                int targetDesktop = pKey->vkCode - '0';
+                Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Virtual Desktop switch: Desktop %d", targetDesktop);
+                if (activeModifiers & MOD_WIN) {
+                    keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
+                }
+                if (g_hHudWnd) {
+                    PostMessageW(g_hHudWnd, WM_USER_SWITCH_DESKTOP, (WPARAM)targetDesktop, 0);
+                } else {
+                    SwitchToDesktopNumber(targetDesktop);
+                }
+            }
+            return 1; // Intercept and swallow so Windows taskbar does not activate pinned apps
+        }
     }
 
     return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
@@ -1129,6 +1565,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 // Dedicated background thread running message loop for WH_KEYBOARD_LL
 static DWORD WINAPI HookThreadProc(LPVOID lpParam) {
     Wh_Log(L"[CustomShortcuts] Hook thread started (ID: %lu)", GetCurrentThreadId());
+
+    HRESULT hrCo = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hrCo)) {
+        Wh_Log(L"[CustomShortcuts] CoInitializeEx returned: 0x%08X", hrCo);
+    }
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = HudWndProc;
@@ -1168,6 +1609,8 @@ static DWORD WINAPI HookThreadProc(LPVOID lpParam) {
 
     if (!g_hKeyboardHook) {
         Wh_Log(L"[CustomShortcuts] ERROR: Failed to install WH_KEYBOARD_LL hook (Error %lu)", GetLastError());
+        CleanupVirtualDesktopAPI();
+        CoUninitialize();
         return 1;
     }
 
@@ -1192,6 +1635,9 @@ static DWORD WINAPI HookThreadProc(LPVOID lpParam) {
     }
 
     UnregisterClassW(L"WindhawkCustomShortcutsHud", GetModuleHandle(NULL));
+
+    CleanupVirtualDesktopAPI();
+    CoUninitialize();
     return 0;
 }
 
@@ -1206,6 +1652,29 @@ static void LoadModSettings() {
     g_settings.hudTheme = (theme && *theme) ? theme : L"dark";
 
     g_settings.enableDirectSwitching = Wh_GetIntSetting(L"virtualDesktops.enableDirectSwitching") != 0;
+
+    LPCWSTR modStr = Wh_GetStringSetting(L"virtualDesktops.desktopModifier");
+    if (modStr && *modStr) {
+        g_settings.desktopModifier = ParseModifierOnlyString(modStr);
+    } else {
+        g_settings.desktopModifier = MOD_WIN;
+    }
+
+    LPCWSTR verStr = Wh_GetStringSetting(L"virtualDesktops.windowsVersion");
+    g_settings.windowsVersion = (verStr && *verStr) ? verStr : L"auto";
+    if (g_settings.windowsVersion == L"win10_old") {
+        g_windowsVersionIndex = 0;
+    } else if (g_settings.windowsVersion == L"win10_20348") {
+        g_windowsVersionIndex = 1;
+    } else if (g_settings.windowsVersion == L"win11_22000") {
+        g_windowsVersionIndex = 2;
+    } else if (g_settings.windowsVersion == L"win11_22621") {
+        g_windowsVersionIndex = 3;
+    } else if (g_settings.windowsVersion == L"win11_26100") {
+        g_windowsVersionIndex = 4;
+    } else {
+        g_windowsVersionIndex = DetectWindowsVersionIndex();
+    }
 
     // Load custom application shortcuts
     g_settings.customApps.clear();
@@ -1249,6 +1718,8 @@ static void LoadModSettings() {
     Wh_Log(L"[CustomShortcuts]   Same-App: '%s' (valid=%d, vk=0x%02X, mods=0x%X)",
            g_settings.bindingSameApp.originalStr.c_str(), g_settings.bindingSameApp.valid,
            g_settings.bindingSameApp.vk, g_settings.bindingSameApp.modifiers);
+    Wh_Log(L"[CustomShortcuts]   Virtual Desktops: enabled=%d, mod=0x%X, versionIndex=%d",
+           g_settings.enableDirectSwitching, g_settings.desktopModifier, g_windowsVersionIndex);
 }
 
 // Windhawk mod initialization
@@ -1277,6 +1748,8 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Wh_Log(L"[CustomShortcuts] Wh_ModUninit called");
 
+    CleanupVirtualDesktopAPI();
+
     if (g_dwHookThreadId) {
         PostThreadMessageW(g_dwHookThreadId, WM_QUIT, 0, 0);
         if (g_hHookThread) {
@@ -1293,6 +1766,7 @@ void Wh_ModUninit() {
 // Settings updated callback
 void Wh_ModSettingsChanged() {
     Wh_Log(L"[CustomShortcuts] Wh_ModSettingsChanged called");
+    CleanupVirtualDesktopAPI();
     LoadModSettings();
     if (g_hHudWnd) {
         InvalidateRect(g_hHudWnd, NULL, TRUE);

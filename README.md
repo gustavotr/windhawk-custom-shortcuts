@@ -87,6 +87,8 @@ Hotkeys can be customized in the settings using standard combinations:
     - hudTheme: dark
 - virtualDesktops:
     - enableDirectSwitching: true
+    - desktopModifier: "win"
+    - windowsVersion: "auto"
 ```
 
 ---
