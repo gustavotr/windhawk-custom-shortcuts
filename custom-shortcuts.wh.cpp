@@ -645,9 +645,9 @@ static void ShowHud() {
     if (screenH <= 0) screenH = 1080;
 
     // Responsive sizing relative to active screen resolution:
-    // Card height is approx 20% of work area height
-    int cardHeight = MulDiv(screenH, 20, 100);
-    cardHeight = std::max(160, std::min(480, cardHeight));
+    // Card height is approx 70% of work area height
+    int cardHeight = MulDiv(screenH, 70, 100);
+    cardHeight = std::max(160, std::min(MulDiv(screenH, 85, 100), cardHeight));
 
     // Footer containing app icon and title
     int footerHeight = MulDiv(cardHeight, 18, 100);
@@ -676,8 +676,8 @@ static void ShowHud() {
     int padY = MulDiv(screenH, 15, 1000);
     padY = std::max(14, std::min(30, padY));
 
-    // Constrain total switcher width to 90% of screen width so cards fit cleanly on screen
-    int maxW = MulDiv(screenW, 90, 100);
+    // Constrain total switcher width to 92% of screen width so cards fit cleanly on screen
+    int maxW = MulDiv(screenW, 92, 100);
     int totalWidth = padX * 2 + (itemCount * cardWidth) + ((itemCount - 1) * cardGap);
 
     if (totalWidth > maxW) {
@@ -687,8 +687,8 @@ static void ShowHud() {
             double scale = static_cast<double>(maxCardW) / static_cast<double>(cardWidth);
             cardWidth = maxCardW;
             cardHeight = std::max(130, static_cast<int>(cardHeight * scale));
-            footerHeight = std::max(24, std::min(48, MulDiv(cardHeight, 18, 100)));
-            thumbMargin = std::max(4, std::min(12, MulDiv(cardHeight, 4, 100)));
+            footerHeight = std::max(24, std::min(54, MulDiv(cardHeight, 18, 100)));
+            thumbMargin = std::max(4, std::min(14, MulDiv(cardHeight, 4, 100)));
         }
         totalWidth = padX * 2 + (itemCount * cardWidth) + ((itemCount - 1) * cardGap);
     }
