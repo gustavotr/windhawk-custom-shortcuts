@@ -16,6 +16,7 @@ You can freely set or customize the key combination for every single action in t
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. | Custom hotkey (e.g. `Alt+Tab`, `Win+\``, `Alt+\``) |
 | | `Alt + Shift + \`` | Cycle backwards through the same application's windows. | Automatic with Shift |
 | | `Esc` / `Enter` | While holding `Alt`, press `Esc` to cancel or `Enter` to commit the switch. Releasing `Alt` also commits. | Built-in |
+| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). | Configurable shortcut list |
 | **Terminal Launcher (Primary)** | `Win + T` | Launch your terminal emulator (defaults to Windows Terminal `wt.exe`). | Custom hotkey (e.g. `Win+T`, `Win+Enter`) |
 | **Terminal Launcher (Secondary)** | `Ctrl + Alt + T` | Linux standard shortcut to launch terminal. | Custom hotkey (e.g. `Ctrl+Alt+T`) |
 | **Close Active Window** | `Win + Q` | Closes the currently active window gracefully (`WM_CLOSE`), KDE Plasma-style. | Custom hotkey (e.g. `Win+Q`, `Alt+Q`, `Win+W`) |

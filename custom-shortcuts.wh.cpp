@@ -2,7 +2,7 @@
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
 // @description     Customizable keyboard shortcuts inspired by KDE on Linux, including same-app window switching with Alt+`, terminal launcher, and window management
-// @version         1.3.0
+// @version         1.4.0
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
@@ -23,6 +23,7 @@ You can customize the key combination for every single action in the mod setting
 | Action | Default Combination | Description |
 | :--- | :--- | :--- |
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. |
+| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). |
 | **Terminal Launcher (Primary)** | `Win + T` | Quickly launch your preferred terminal emulator (defaults to Windows Terminal `wt.exe`). |
 | **Terminal Launcher (Secondary)**| `Ctrl + Alt + T` | Standard Linux shortcut to launch the terminal emulator. |
 | **Close Active Window** | `Win + Q` | Closes the currently active window gracefully (`WM_CLOSE`), KDE Plasma-style. |
@@ -50,6 +51,13 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
 
 // ==WindhawkModSettings==
 /*
+- customApps:
+  - shortcut: "Win+Enter"
+    target: "cmd.exe"
+    arguments: ""
+  $name: Custom Application Shortcuts
+  $description: >-
+    Define custom key combinations to launch any application or command (e.g. Win+Enter -> cmd.exe).
 - shortcuts:
     - hotkeySameApp: "Alt+`"
       $name: Same-App Window Switcher
@@ -117,6 +125,13 @@ struct HotkeyBinding {
     }
 };
 
+// Custom application shortcut entry
+struct CustomAppShortcut {
+    HotkeyBinding binding;
+    std::wstring target;
+    std::wstring arguments;
+};
+
 // Mod settings structure
 struct ModSettings {
     HotkeyBinding bindingSameApp;
@@ -124,6 +139,8 @@ struct ModSettings {
     HotkeyBinding bindingTerminalCtrlAltT;
     HotkeyBinding bindingCloseWindow;
     HotkeyBinding bindingToggleFullscreen;
+
+    std::vector<CustomAppShortcut> customApps;
 
     std::wstring terminalPath = L"wt.exe";
     bool showHud = true;
@@ -937,6 +954,23 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     }
 }
 
+// Helper: launch application or command line cleanly
+static void LaunchApplication(const std::wstring& target, const std::wstring& arguments) {
+    if (target.empty()) return;
+
+    LPCWSTR pArgs = arguments.empty() ? NULL : arguments.c_str();
+    HINSTANCE hRes = ShellExecuteW(NULL, L"open", target.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+
+    // If target was wt.exe and direct search failed, try WindowsApps path
+    if ((INT_PTR)hRes <= 32 && _wcsicmp(target.c_str(), L"wt.exe") == 0) {
+        WCHAR localAppData[MAX_PATH] = {0};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
+            std::wstring fullWt = std::wstring(localAppData) + L"\\Microsoft\\WindowsApps\\wt.exe";
+            ShellExecuteW(NULL, L"open", fullWt.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+        }
+    }
+}
+
 // Low-level keyboard hook callback
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION) {
@@ -1028,28 +1062,42 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
     }
 
-    // 2. Terminal Launchers (Primary and Secondary)
+    // 2. Custom Application Launchers (e.g. Win+Enter -> cmd.exe)
+    if (isKeyDown) {
+        for (const auto& app : g_settings.customApps) {
+            if (app.binding.Matches(activeModifiers, pKey->vkCode)) {
+                Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Custom App Launcher! '%s' -> '%s' (args: '%s')",
+                       app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+                if (activeModifiers & MOD_WIN) {
+                    keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
+                }
+                LaunchApplication(app.target, app.arguments);
+                return 1;
+            }
+        }
+    }
+
+    // 3. Terminal Launchers (Primary and Secondary)
     if (isKeyDown && !g_settings.terminalPath.empty()) {
         if (g_settings.bindingTerminalWinT.Matches(activeModifiers, pKey->vkCode) ||
             g_settings.bindingTerminalCtrlAltT.Matches(activeModifiers, pKey->vkCode)) {
             Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Terminal Launcher! Launching: %s",
                    g_settings.terminalPath.c_str());
-            HINSTANCE hRes = ShellExecuteW(NULL, L"open", g_settings.terminalPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
-            if ((INT_PTR)hRes <= 32 && _wcsicmp(g_settings.terminalPath.c_str(), L"wt.exe") == 0) {
-                WCHAR localAppData[MAX_PATH] = {0};
-                if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
-                    std::wstring fullWt = std::wstring(localAppData) + L"\\Microsoft\\WindowsApps\\wt.exe";
-                    ShellExecuteW(NULL, L"open", fullWt.c_str(), NULL, NULL, SW_SHOWNORMAL);
-                }
+            if (activeModifiers & MOD_WIN) {
+                keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
             }
+            LaunchApplication(g_settings.terminalPath, L"");
             return 1;
         }
     }
 
-    // 3. Close Active Window
+    // 4. Close Active Window
     if (isKeyDown && g_settings.bindingCloseWindow.Matches(activeModifiers, pKey->vkCode)) {
         Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Close Active Window! (%s)",
                g_settings.bindingCloseWindow.originalStr.c_str());
+        if (activeModifiers & MOD_WIN) {
+            keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
+        }
         HWND hForeground = GetForegroundWindow();
         if (hForeground) {
             PostMessageW(hForeground, WM_CLOSE, 0, 0);
@@ -1057,10 +1105,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         return 1;
     }
 
-    // 4. Toggle Fullscreen / Maximize
+    // 5. Toggle Fullscreen / Maximize
     if (isKeyDown && g_settings.bindingToggleFullscreen.Matches(activeModifiers, pKey->vkCode)) {
         Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Toggle Fullscreen/Maximize! (%s)",
                g_settings.bindingToggleFullscreen.originalStr.c_str());
+        if (activeModifiers & MOD_WIN) {
+            keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
+        }
         HWND hForeground = GetForegroundWindow();
         if (hForeground) {
             WINDOWPLACEMENT wp = { sizeof(wp) };
@@ -1075,7 +1126,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         return 1;
     }
 
-    // 5. Virtual Desktop Direct Switching: Win + 1..9
+    // 6. Virtual Desktop Direct Switching: Win + 1..9
     if (g_settings.enableDirectSwitching && isKeyDown && (pKey->vkCode >= '1' && pKey->vkCode <= '9') &&
         (activeModifiers == MOD_WIN)) {
         Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Virtual Desktop switch: Desktop %c", (char)pKey->vkCode);
@@ -1179,6 +1230,43 @@ static void LoadModSettings() {
     g_settings.hudTheme = (theme && *theme) ? theme : L"dark";
 
     g_settings.enableDirectSwitching = Wh_GetIntSetting(L"virtualDesktops.enableDirectSwitching") != 0;
+
+    // Load custom application shortcuts array
+    g_settings.customApps.clear();
+    for (int i = 0;; ++i) {
+        PCWSTR shortcutStr = Wh_GetStringSetting(L"customApps[%d].shortcut", i);
+        if (!shortcutStr || *shortcutStr == L'\0') {
+            if (shortcutStr) Wh_FreeStringSetting(shortcutStr);
+            break;
+        }
+
+        PCWSTR targetStr = Wh_GetStringSetting(L"customApps[%d].target", i);
+        PCWSTR argsStr = Wh_GetStringSetting(L"customApps[%d].arguments", i);
+
+        CustomAppShortcut app;
+        ParseHotkeyString(shortcutStr, app.binding);
+        if (targetStr && *targetStr) app.target = targetStr;
+        if (argsStr && *argsStr) app.arguments = argsStr;
+
+        if (app.binding.valid && !app.target.empty()) {
+            g_settings.customApps.push_back(app);
+            Wh_Log(L"[CustomShortcuts]   Custom App %d: '%s' -> '%s' (args: '%s')",
+                   i, app.binding.originalStr.c_str(), app.target.c_str(), app.arguments.c_str());
+        }
+
+        Wh_FreeStringSetting(shortcutStr);
+        if (targetStr) Wh_FreeStringSetting(targetStr);
+        if (argsStr) Wh_FreeStringSetting(argsStr);
+    }
+
+    // Default fallback: if no custom apps configured, provide Win+Enter -> cmd.exe
+    if (g_settings.customApps.empty()) {
+        CustomAppShortcut defaultApp;
+        ParseHotkeyString(L"Win+Enter", defaultApp.binding);
+        defaultApp.target = L"cmd.exe";
+        g_settings.customApps.push_back(defaultApp);
+        Wh_Log(L"[CustomShortcuts]   Default Custom App: 'Win+Enter' -> 'cmd.exe'");
+    }
 
     Wh_Log(L"[CustomShortcuts] Settings loaded:");
     Wh_Log(L"[CustomShortcuts]   Same-App: '%s' (valid=%d, vk=0x%02X, mods=0x%X)",
