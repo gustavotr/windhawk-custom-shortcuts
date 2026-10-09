@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
-// @description     Customizable keyboard shortcuts inspired by Linux, including same-app window switching with Alt+`, custom application launchers, and window management
-// @version         1.5.0
+// @description     Customizable keyboard shortcuts inspired by Linux, including same-app window switching with Alt+`, custom application launchers, and virtual desktop navigation
+// @version         1.0.0
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
