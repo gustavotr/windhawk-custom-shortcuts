@@ -2,7 +2,7 @@
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
 // @description     Customizable keyboard shortcuts inspired by KDE on Linux, including same-app window switching with Alt+`, terminal launcher, and window management
-// @version         1.2.0
+// @version         1.3.0
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
@@ -41,7 +41,7 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
 ## How the Same-App Switcher Works
 
 1. Press your configured hotkey (default `Alt + \``) to focus and list only windows of the active application.
-2. A lightweight HUD popup displays all matching windows with their application icons and titles.
+2. A native Alt+Tab-style preview displays all matching windows with live DWM thumbnails, icons, and titles.
 3. Keep the modifier (e.g. `Alt`) held down and tap the key (or `Shift + key`) to cycle forward and backward.
 4. Use arrow keys (`Up`/`Down`/`Left`/`Right`) to browse. Press `Esc` to cancel.
 5. Release the modifier (or press `Enter`) to switch to the selected window.
@@ -138,7 +138,20 @@ struct AppWindowEntry {
     HWND hWnd = NULL;
     std::wstring title;
     HICON hIcon = NULL;
+    HTHUMBNAIL hThumbnail = NULL;
+    RECT rcCard = {0};
+    RECT rcThumb = {0};
 };
+
+// Layout metrics computed dynamically based on monitor work area
+struct HudLayoutMetrics {
+    int winCornerRadius = 16;
+    int cardCornerRadius = 12;
+    int iconSize = 18;
+    int fontSize = 12;
+    int thumbMargin = 8;
+};
+static HudLayoutMetrics g_hudLayout;
 
 // Global state
 #define TIMER_ALT_POLL 101
@@ -557,6 +570,43 @@ static void CycleSelection(int direction) {
     }
 }
 
+// Helper: query system dark mode preference
+static bool IsSystemDarkMode() {
+    if (g_settings.hudTheme == L"light") return false;
+    if (g_settings.hudTheme == L"dark") return true;
+
+    DWORD lightTheme = 1;
+    DWORD sz = sizeof(lightTheme);
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"AppsUseLightTheme", NULL, NULL, (LPBYTE)&lightTheme, &sz);
+        RegCloseKey(hKey);
+    }
+    return lightTheme == 0;
+}
+
+// Helper: query system accent color from registry
+static COLORREF GetSystemAccentColor(bool isDark) {
+    DWORD accent = 0;
+    DWORD sz = sizeof(accent);
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\DWM",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"AccentColor", NULL, NULL, (LPBYTE)&accent, &sz);
+        RegCloseKey(hKey);
+    }
+    if (accent != 0) {
+        BYTE r = accent & 0xFF;
+        BYTE g = (accent >> 8) & 0xFF;
+        BYTE b = (accent >> 16) & 0xFF;
+        return RGB(r, g, b);
+    }
+    return isDark ? RGB(0, 120, 215) : RGB(0, 102, 204);
+}
+
 static void ShowHud() {
     RefreshAppWindows();
     Wh_Log(L"[CustomShortcuts] Found %d window(s) for app key '%s' (%s)",
@@ -582,22 +632,127 @@ static void ShowHud() {
     if (!g_hHudWnd) return;
 
     int itemCount = static_cast<int>(g_appWindows.size());
-    int itemHeight = 44;
-    int padding = 20;
-    int hudWidth = 460;
-    int hudHeight = padding * 2 + (itemCount * itemHeight);
-    hudHeight = std::min(hudHeight, 600);
+    if (itemCount <= 0) return;
 
     HWND hForeground = GetForegroundWindow();
     HMONITOR hMon = MonitorFromWindow(hForeground ? hForeground : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
     GetMonitorInfoW(hMon, &mi);
 
-    int posX = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - hudWidth) / 2;
-    int posY = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - hudHeight) / 2;
+    int screenW = mi.rcWork.right - mi.rcWork.left;
+    int screenH = mi.rcWork.bottom - mi.rcWork.top;
+    if (screenW <= 0) screenW = 1920;
+    if (screenH <= 0) screenH = 1080;
+
+    // Responsive sizing relative to active screen resolution:
+    // Card height is approx 20% of work area height
+    int cardHeight = MulDiv(screenH, 20, 100);
+    cardHeight = std::max(160, std::min(480, cardHeight));
+
+    // Footer containing app icon and title
+    int footerHeight = MulDiv(cardHeight, 18, 100);
+    footerHeight = std::max(28, std::min(54, footerHeight));
+
+    // Inner margin inside card around the thumbnail
+    int thumbMargin = MulDiv(cardHeight, 4, 100);
+    thumbMargin = std::max(6, std::min(14, thumbMargin));
+
+    // Thumbnail height and aspect ratio matching active monitor work area
+    int thumbH = cardHeight - footerHeight - (thumbMargin * 2);
+    if (thumbH < 60) thumbH = 60;
+    int thumbW = MulDiv(thumbH, screenW, screenH);
+    if (thumbW < 80) thumbW = 80;
+
+    // Card width accommodates thumbnail plus side margins
+    int cardWidth = thumbW + (thumbMargin * 2);
+
+    // Spacing between cards and window padding
+    int cardGap = MulDiv(screenW, 1, 100);
+    cardGap = std::max(10, std::min(24, cardGap));
+
+    int padX = MulDiv(screenW, 12, 1000);
+    padX = std::max(14, std::min(30, padX));
+
+    int padY = MulDiv(screenH, 15, 1000);
+    padY = std::max(14, std::min(30, padY));
+
+    // Constrain total switcher width to 90% of screen width so cards fit cleanly on screen
+    int maxW = MulDiv(screenW, 90, 100);
+    int totalWidth = padX * 2 + (itemCount * cardWidth) + ((itemCount - 1) * cardGap);
+
+    if (totalWidth > maxW) {
+        int availableForCards = maxW - (padX * 2) - ((itemCount - 1) * cardGap);
+        int maxCardW = std::max(120, availableForCards / itemCount);
+        if (maxCardW < cardWidth) {
+            double scale = static_cast<double>(maxCardW) / static_cast<double>(cardWidth);
+            cardWidth = maxCardW;
+            cardHeight = std::max(130, static_cast<int>(cardHeight * scale));
+            footerHeight = std::max(24, std::min(48, MulDiv(cardHeight, 18, 100)));
+            thumbMargin = std::max(4, std::min(12, MulDiv(cardHeight, 4, 100)));
+        }
+        totalWidth = padX * 2 + (itemCount * cardWidth) + ((itemCount - 1) * cardGap);
+    }
+
+    int hudWidth = totalWidth;
+    int hudHeight = padY * 2 + cardHeight;
+
+    // Update layout metrics for WM_PAINT
+    g_hudLayout.winCornerRadius = std::max(12, std::min(24, MulDiv(cardHeight, 9, 100)));
+    g_hudLayout.cardCornerRadius = std::max(8, std::min(18, MulDiv(cardHeight, 7, 100)));
+    g_hudLayout.iconSize = std::max(16, std::min(28, MulDiv(footerHeight, 55, 100)));
+    g_hudLayout.fontSize = std::max(11, std::min(18, MulDiv(footerHeight, 38, 100)));
+    g_hudLayout.thumbMargin = thumbMargin;
+
+    int posX = mi.rcWork.left + (screenW - hudWidth) / 2;
+    int posY = mi.rcWork.top + (screenH - hudHeight) / 2;
 
     SetWindowPos(g_hHudWnd, HWND_TOPMOST, posX, posY, hudWidth, hudHeight,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    // Rounded window region matching scaled corner radius
+    HRGN hRgn = CreateRoundRectRgn(0, 0, hudWidth + 1, hudHeight + 1,
+                                   g_hudLayout.winCornerRadius, g_hudLayout.winCornerRadius);
+    SetWindowRgn(g_hHudWnd, hRgn, TRUE);
+    DeleteObject(hRgn);
+
+    // Apply Windows 11 DWM attributes if supported
+    BOOL darkMode = IsSystemDarkMode();
+    DwmSetWindowAttribute(g_hHudWnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &darkMode, sizeof(darkMode));
+    DWORD cornerPref = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(g_hHudWnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref));
+
+    // Register / update live DWM thumbnails for each card
+    for (int i = 0; i < itemCount; ++i) {
+        int left = padX + i * (cardWidth + cardGap);
+        int top = padY;
+        g_appWindows[i].rcCard = { left, top, left + cardWidth, top + cardHeight };
+
+        g_appWindows[i].rcThumb = {
+            left + thumbMargin,
+            top + thumbMargin,
+            left + cardWidth - thumbMargin,
+            top + cardHeight - footerHeight - thumbMargin
+        };
+
+        if (IsWindow(g_appWindows[i].hWnd)) {
+            if (!g_appWindows[i].hThumbnail) {
+                HTHUMBNAIL hT = NULL;
+                if (SUCCEEDED(DwmRegisterThumbnail(g_hHudWnd, g_appWindows[i].hWnd, &hT))) {
+                    g_appWindows[i].hThumbnail = hT;
+                }
+            }
+
+            if (g_appWindows[i].hThumbnail) {
+                DWM_THUMBNAIL_PROPERTIES props = {};
+                props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY;
+                props.rcDestination = g_appWindows[i].rcThumb;
+                props.fVisible = TRUE;
+                props.opacity = 255;
+                DwmUpdateThumbnailProperties(g_appWindows[i].hThumbnail, &props);
+            }
+        }
+    }
+
     InvalidateRect(g_hHudWnd, NULL, TRUE);
 }
 
@@ -608,6 +763,14 @@ static void HideHud(bool commitSwitch) {
     if (g_hHudWnd) {
         KillTimer(g_hHudWnd, TIMER_ALT_POLL);
         ShowWindow(g_hHudWnd, SW_HIDE);
+    }
+
+    // Unregister all DWM thumbnails
+    for (auto& entry : g_appWindows) {
+        if (entry.hThumbnail) {
+            DwmUnregisterThumbnail(entry.hThumbnail);
+            entry.hThumbnail = NULL;
+        }
     }
 
     if (commitSwitch && !g_appWindows.empty() && g_selectedIndex >= 0 &&
@@ -635,68 +798,93 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, clientRect.right, clientRect.bottom);
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-        bool isDark = (g_settings.hudTheme == L"dark");
-        COLORREF bgColor = isDark ? RGB(32, 32, 32) : RGB(245, 245, 245);
-        COLORREF borderColor = isDark ? RGB(60, 60, 60) : RGB(200, 200, 200);
-        COLORREF textColor = isDark ? RGB(240, 240, 240) : RGB(20, 20, 20);
-        COLORREF selBgColor = isDark ? RGB(60, 90, 140) : RGB(190, 215, 250);
-        COLORREF selTextColor = isDark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+        bool isDark = IsSystemDarkMode();
+        COLORREF accentColor = GetSystemAccentColor(isDark);
 
+        // System-matching colors
+        COLORREF bgColor = isDark ? RGB(26, 26, 28) : RGB(242, 242, 245);
+        COLORREF cardBgColor = isDark ? RGB(36, 36, 40) : RGB(255, 255, 255);
+        COLORREF cardBorderColor = isDark ? RGB(52, 52, 56) : RGB(220, 220, 225);
+
+        COLORREF selCardBgColor = isDark ? RGB(50, 52, 58) : RGB(232, 238, 248);
+        COLORREF selCardBorderColor = accentColor;
+
+        COLORREF textColor = isDark ? RGB(235, 235, 235) : RGB(25, 25, 25);
+        COLORREF thumbPlaceholderColor = isDark ? RGB(20, 20, 22) : RGB(230, 230, 234);
+
+        // Fill window background
         HBRUSH bgBrush = CreateSolidBrush(bgColor);
         FillRect(memDC, &clientRect, bgBrush);
         DeleteObject(bgBrush);
 
-        HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
-        HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
+        // Subtle window outline border
+        HPEN winBorderPen = CreatePen(PS_SOLID, 1, isDark ? RGB(55, 55, 60) : RGB(205, 205, 210));
+        HPEN oldWinPen = (HPEN)SelectObject(memDC, winBorderPen);
         SelectObject(memDC, GetStockObject(NULL_BRUSH));
-        Rectangle(memDC, 0, 0, clientRect.right, clientRect.bottom);
-        SelectObject(memDC, oldPen);
-        DeleteObject(borderPen);
+        RoundRect(memDC, clientRect.left, clientRect.top, clientRect.right, clientRect.bottom,
+                  g_hudLayout.winCornerRadius, g_hudLayout.winCornerRadius);
+        SelectObject(memDC, oldWinPen);
+        DeleteObject(winBorderPen);
 
-        SetBkMode(memDC, TRANSPARENT);
-        HFONT hFontTitle = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT oldFont = (HFONT)SelectObject(memDC, hFontTitle);
-
-        RECT headerRect = { 16, 8, clientRect.right - 16, 26 };
-        SetTextColor(memDC, isDark ? RGB(160, 160, 160) : RGB(100, 100, 100));
-        DrawTextW(memDC, L"Same-Application Switcher", -1, &headerRect, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
-
-        HFONT hFontItem = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        // Proportional font for window titles
+        HFONT hFontItem = CreateFontW(-g_hudLayout.fontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        SelectObject(memDC, hFontItem);
-
-        int startY = 32;
-        int itemHeight = 40;
-        int paddingX = 12;
+        HFONT oldFont = (HFONT)SelectObject(memDC, hFontItem);
 
         for (int i = 0; i < static_cast<int>(g_appWindows.size()); ++i) {
-            RECT itemRect = { paddingX, startY + (i * itemHeight), clientRect.right - paddingX, startY + ((i + 1) * itemHeight) };
+            const auto& entry = g_appWindows[i];
             bool isSelected = (i == g_selectedIndex);
 
-            if (isSelected) {
-                HBRUSH selBrush = CreateSolidBrush(selBgColor);
-                FillRect(memDC, &itemRect, selBrush);
-                DeleteObject(selBrush);
+            // Card background and rounded border
+            COLORREF cBg = isSelected ? selCardBgColor : cardBgColor;
+            COLORREF cBorder = isSelected ? selCardBorderColor : cardBorderColor;
+            int borderWidth = isSelected ? 2 : 1;
+
+            HBRUSH cardBrush = CreateSolidBrush(cBg);
+            HPEN cardPen = CreatePen(PS_SOLID, borderWidth, cBorder);
+            HBRUSH oldB = (HBRUSH)SelectObject(memDC, cardBrush);
+            HPEN oldP = (HPEN)SelectObject(memDC, cardPen);
+
+            RoundRect(memDC, entry.rcCard.left, entry.rcCard.top,
+                      entry.rcCard.right, entry.rcCard.bottom,
+                      g_hudLayout.cardCornerRadius, g_hudLayout.cardCornerRadius);
+
+            SelectObject(memDC, oldB);
+            SelectObject(memDC, oldP);
+            DeleteObject(cardBrush);
+            DeleteObject(cardPen);
+
+            // Placeholder background for thumbnail area
+            HBRUSH thumbPlaceholderBrush = CreateSolidBrush(thumbPlaceholderColor);
+            FillRect(memDC, &entry.rcThumb, thumbPlaceholderBrush);
+            DeleteObject(thumbPlaceholderBrush);
+
+            // Bottom section: App Icon + Window Title
+            int iconSize = g_hudLayout.iconSize;
+            int footerTop = entry.rcThumb.bottom;
+            int footerH = entry.rcCard.bottom - footerTop;
+            int iconX = entry.rcCard.left + g_hudLayout.thumbMargin;
+            int iconY = footerTop + (footerH - iconSize) / 2;
+
+            if (entry.hIcon) {
+                DrawIconEx(memDC, iconX, iconY, entry.hIcon, iconSize, iconSize, 0, NULL, DI_NORMAL);
             }
 
-            int iconSize = 20;
-            int iconX = itemRect.left + 8;
-            int iconY = itemRect.top + (itemHeight - iconSize) / 2;
-            if (g_appWindows[i].hIcon) {
-                DrawIconEx(memDC, iconX, iconY, g_appWindows[i].hIcon, iconSize, iconSize, 0, NULL, DI_NORMAL);
-            }
+            RECT textRect = {
+                iconX + iconSize + 8,
+                footerTop,
+                entry.rcCard.right - g_hudLayout.thumbMargin,
+                entry.rcCard.bottom
+            };
 
-            RECT textRect = { iconX + iconSize + 10, itemRect.top, itemRect.right - 8, itemRect.bottom };
-            SetTextColor(memDC, isSelected ? selTextColor : textColor);
-            DrawTextW(memDC, g_appWindows[i].title.c_str(), -1, &textRect,
+            SetTextColor(memDC, textColor);
+            SetBkMode(memDC, TRANSPARENT);
+            DrawTextW(memDC, entry.title.c_str(), -1, &textRect,
                       DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
 
         SelectObject(memDC, oldFont);
-        DeleteObject(hFontTitle);
         DeleteObject(hFontItem);
 
         BitBlt(hdc, 0, 0, clientRect.right, clientRect.bottom, memDC, 0, 0, SRCCOPY);
@@ -731,14 +919,12 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         }
         break;
     case WM_LBUTTONDOWN: {
-        int y = HIWORD(lParam);
-        int startY = 32;
-        int itemHeight = 40;
-        if (y >= startY) {
-            int clickedIdx = (y - startY) / itemHeight;
-            if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_appWindows.size())) {
-                g_selectedIndex = clickedIdx;
+        POINT pt = { (LONG)LOWORD(lParam), (LONG)HIWORD(lParam) };
+        for (size_t i = 0; i < g_appWindows.size(); ++i) {
+            if (PtInRect(&g_appWindows[i].rcCard, pt)) {
+                g_selectedIndex = static_cast<int>(i);
                 HideHud(true);
+                break;
             }
         }
         return 0;
@@ -909,13 +1095,17 @@ static DWORD WINAPI HookThreadProc(LPVOID lpParam) {
     RegisterClassExW(&wc);
 
     g_hHudWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         wc.lpszClassName,
         L"CustomShortcutsHUD",
         WS_POPUP,
         0, 0, 460, 200,
         NULL, NULL, wc.hInstance, NULL
     );
+
+    if (g_hHudWnd) {
+        SetLayeredWindowAttributes(g_hHudWnd, 0, 246, LWA_ALPHA);
+    }
 
     g_hKeyboardHook = SetWindowsHookExW(
         WH_KEYBOARD_LL,

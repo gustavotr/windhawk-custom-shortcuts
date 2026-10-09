@@ -54,7 +54,7 @@ Hotkeys can be customized in the settings using standard combinations:
 
 1. Pressing the configured hotkey (default `Alt + \``) identifies the executable and process ID of the currently focused window.
 2. It gathers all visible top-level windows belonging to that application.
-3. A sleek, unobtrusive HUD preview displays the windows along with their application icons and titles.
+3. A native Alt+Tab-style preview displays the windows along with live DWM thumbnails, application icons, and titles.
 4. Continuing to hold the modifier (e.g. `Alt`) and tapping `` ` `` (or `Shift + ` ``) cycles forward and backward through the windows.
 5. Releasing `Alt` instantly brings the chosen window to the foreground.
 
