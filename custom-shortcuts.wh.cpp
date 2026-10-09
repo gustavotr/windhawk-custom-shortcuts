@@ -93,10 +93,10 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
       $description: Optional command line arguments for Custom Application 1.
     - customAppPath2: ""
       $name: Custom App 2 Executable
-      $description: Path or executable to launch with Custom App 2 Shortcut.
+      $description: Path or executable to launch with Custom App 2 Shortcut (e.g. wsl.exe, cmd.exe).
     - customAppArgs2: ""
       $name: Custom App 2 Arguments
-      $description: Optional command line arguments for Custom Application 2.
+      $description: Optional command line arguments for Custom Application 2 (e.g. --cd ~ or -- cd ~).
     - customAppPath3: ""
       $name: Custom App 3 Executable
       $description: Path or executable to launch with Custom App 3 Shortcut.
@@ -978,19 +978,64 @@ static LRESULT CALLBACK HudWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     }
 }
 
-// Helper: launch application or command line cleanly
+// Helper: launch application or command line cleanly with arguments
 static void LaunchApplication(const std::wstring& target, const std::wstring& arguments) {
     if (target.empty()) return;
 
-    LPCWSTR pArgs = arguments.empty() ? NULL : arguments.c_str();
-    HINSTANCE hRes = ShellExecuteW(NULL, L"open", target.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+    std::wstring execPath = target;
+    std::wstring execArgs = arguments;
 
-    // If target was wt.exe and direct search failed, try WindowsApps path
-    if ((INT_PTR)hRes <= 32 && _wcsicmp(target.c_str(), L"wt.exe") == 0) {
-        WCHAR localAppData[MAX_PATH] = {0};
-        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
-            std::wstring fullWt = std::wstring(localAppData) + L"\\Microsoft\\WindowsApps\\wt.exe";
-            ShellExecuteW(NULL, L"open", fullWt.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+    // Trim whitespace
+    while (!execPath.empty() && (execPath.front() == L' ' || execPath.front() == L'\t')) execPath.erase(0, 1);
+    while (!execPath.empty() && (execPath.back() == L' ' || execPath.back() == L'\t')) execPath.pop_back();
+    while (!execArgs.empty() && (execArgs.front() == L' ' || execArgs.front() == L'\t')) execArgs.erase(0, 1);
+    while (!execArgs.empty() && (execArgs.back() == L' ' || execArgs.back() == L'\t')) execArgs.pop_back();
+
+    // If arguments are empty and target contains spaces, check if target has command line arguments embedded
+    // (e.g. user typed "wsl -- cd ~" or "\"C:\Tools\app.exe\" --arg" directly into the path field)
+    if (execArgs.empty() && execPath.find(L' ') != std::wstring::npos) {
+        if (GetFileAttributesW(execPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            if (execPath.front() == L'\"') {
+                size_t closeQuote = execPath.find(L'\"', 1);
+                if (closeQuote != std::wstring::npos) {
+                    std::wstring candidateExec = execPath.substr(1, closeQuote - 1);
+                    std::wstring candidateArgs = execPath.substr(closeQuote + 1);
+                    while (!candidateArgs.empty() && (candidateArgs.front() == L' ' || candidateArgs.front() == L'\t')) candidateArgs.erase(0, 1);
+                    execPath = candidateExec;
+                    execArgs = candidateArgs;
+                }
+            } else {
+                size_t firstSpace = execPath.find(L' ');
+                if (firstSpace != std::wstring::npos) {
+                    std::wstring candidateExec = execPath.substr(0, firstSpace);
+                    std::wstring candidateArgs = execPath.substr(firstSpace + 1);
+                    while (!candidateArgs.empty() && (candidateArgs.front() == L' ' || candidateArgs.front() == L'\t')) candidateArgs.erase(0, 1);
+                    execPath = candidateExec;
+                    execArgs = candidateArgs;
+                }
+            }
+        }
+    }
+
+    Wh_Log(L"[CustomShortcuts] Launching: '%s', args: '%s'", execPath.c_str(), execArgs.c_str());
+
+    LPCWSTR pArgs = execArgs.empty() ? NULL : execArgs.c_str();
+    HINSTANCE hRes = ShellExecuteW(NULL, L"open", execPath.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+
+    // If ShellExecute failed, try fallback paths for wt.exe or wsl.exe
+    if ((INT_PTR)hRes <= 32) {
+        if (_wcsicmp(execPath.c_str(), L"wt.exe") == 0 || _wcsicmp(execPath.c_str(), L"wt") == 0) {
+            WCHAR localAppData[MAX_PATH] = {0};
+            if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
+                std::wstring fullWt = std::wstring(localAppData) + L"\\Microsoft\\WindowsApps\\wt.exe";
+                ShellExecuteW(NULL, L"open", fullWt.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+            }
+        } else if (_wcsicmp(execPath.c_str(), L"wsl.exe") == 0 || _wcsicmp(execPath.c_str(), L"wsl") == 0) {
+            WCHAR sysDir[MAX_PATH] = {0};
+            if (GetSystemDirectoryW(sysDir, ARRAYSIZE(sysDir))) {
+                std::wstring fullWsl = std::wstring(sysDir) + L"\\wsl.exe";
+                ShellExecuteW(NULL, L"open", fullWsl.c_str(), pArgs, NULL, SW_SHOWNORMAL);
+            }
         }
     }
 }
