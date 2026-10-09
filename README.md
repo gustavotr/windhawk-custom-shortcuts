@@ -17,7 +17,6 @@ You can freely set or customize the key combination for every single action in t
 | | `Alt + Shift + \`` | Cycle backwards through the same application's windows. | Automatic with Shift |
 | | `Esc` / `Enter` | While holding `Alt`, press `Esc` to cancel or `Enter` to commit the switch. Releasing `Alt` also commits. | Built-in |
 | **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). | Configurable shortcut list (e.g. `cmd.exe`, `wsl -- cd ~`) |
-| **Toggle Fullscreen / Maximize** | `Win + F` | Toggle Fullscreen / Maximize on the active window. | Custom hotkey (e.g. `Win+F`, `F11`, `Alt+Enter`) |
 | **Virtual Desktops** | `Win + 1 ... 9` | Direct access and navigation across virtual desktops. | Toggle setting |
 
 *Tip: To disable any shortcut, simply clear its text in the settings.*
@@ -73,12 +72,16 @@ Hotkeys can be customized in the settings using standard combinations:
 ```yaml
 - shortcuts:
     - hotkeySameApp: "Alt+`"
-    - hotkeyTerminalWinT: "Win+T"
-    - hotkeyTerminalCtrlAltT: "Ctrl+Alt+T"
-    - hotkeyCloseWindow: "Win+Q"
-    - hotkeyToggleFullscreen: "Win+F"
-- terminalOptions:
-    - terminalPath: "wt.exe"
+    - hotkeyCustomApp1: "Win+Enter"
+    - hotkeyCustomApp2: ""
+    - hotkeyCustomApp3: ""
+- customAppOptions:
+    - customAppPath1: "cmd.exe"
+    - customAppArgs1: ""
+    - customAppPath2: ""
+    - customAppArgs2: ""
+    - customAppPath3: ""
+    - customAppArgs3: ""
 - hudOptions:
     - showHud: true
     - hudTheme: dark

@@ -24,7 +24,6 @@ You can customize the key combination for every single action in the mod setting
 | :--- | :--- | :--- |
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. |
 | **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (e.g. `cmd.exe`, `wsl -- cd ~`). |
-| **Toggle Fullscreen / Maximize**| `Win + F` | Toggles maximize / restore on the active window. |
 | **Virtual Desktop Navigation** | `Win + 1 ... 9` | Direct switching to virtual desktop 1 through 9. |
 
 *To disable any shortcut, simply clear its setting field.*
@@ -65,10 +64,6 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
       $name: Custom App 3 Shortcut
       $description: >-
         Key combination to launch Custom Application 3. Leave empty to disable.
-    - hotkeyToggleFullscreen: "Win+F"
-      $name: Toggle Fullscreen / Maximize
-      $description: >-
-        Key combination to toggle fullscreen / maximize (e.g. Win+F, F11, Alt+Enter). Leave empty to disable.
 - customAppOptions:
     - customAppPath1: "cmd.exe"
       $name: Custom App 1 Executable
@@ -140,7 +135,6 @@ struct CustomAppShortcut {
 // Mod settings structure
 struct ModSettings {
     HotkeyBinding bindingSameApp;
-    HotkeyBinding bindingToggleFullscreen;
 
     std::vector<CustomAppShortcut> customApps;
 
@@ -1123,28 +1117,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
     }
 
-    // 3. Toggle Fullscreen / Maximize
-    if (isKeyDown && g_settings.bindingToggleFullscreen.Matches(activeModifiers, pKey->vkCode)) {
-        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Toggle Fullscreen/Maximize! (%s)",
-               g_settings.bindingToggleFullscreen.originalStr.c_str());
-        if (activeModifiers & MOD_WIN) {
-            keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
-        }
-        HWND hForeground = GetForegroundWindow();
-        if (hForeground) {
-            WINDOWPLACEMENT wp = { sizeof(wp) };
-            if (GetWindowPlacement(hForeground, &wp)) {
-                if (wp.showCmd == SW_SHOWMAXIMIZED) {
-                    ShowWindow(hForeground, SW_RESTORE);
-                } else {
-                    ShowWindow(hForeground, SW_MAXIMIZE);
-                }
-            }
-        }
-        return 1;
-    }
-
-    // 6. Virtual Desktop Direct Switching: Win + 1..9
+    // 3. Virtual Desktop Direct Switching: Win + 1..9
     if (g_settings.enableDirectSwitching && isKeyDown && (pKey->vkCode >= '1' && pKey->vkCode <= '9') &&
         (activeModifiers == MOD_WIN)) {
         Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Virtual Desktop switch: Desktop %c", (char)pKey->vkCode);
@@ -1227,9 +1200,6 @@ static void LoadModSettings() {
     LPCWSTR sameAppStr = Wh_GetStringSetting(L"shortcuts.hotkeySameApp");
     ParseHotkeyString((sameAppStr && *sameAppStr) ? sameAppStr : L"Alt+`", g_settings.bindingSameApp);
 
-    LPCWSTR fsStr = Wh_GetStringSetting(L"shortcuts.hotkeyToggleFullscreen");
-    ParseHotkeyString((fsStr && *fsStr) ? fsStr : L"Win+F", g_settings.bindingToggleFullscreen);
-
     g_settings.showHud = Wh_GetIntSetting(L"hudOptions.showHud") != 0;
 
     LPCWSTR theme = Wh_GetStringSetting(L"hudOptions.hudTheme");
@@ -1279,8 +1249,6 @@ static void LoadModSettings() {
     Wh_Log(L"[CustomShortcuts]   Same-App: '%s' (valid=%d, vk=0x%02X, mods=0x%X)",
            g_settings.bindingSameApp.originalStr.c_str(), g_settings.bindingSameApp.valid,
            g_settings.bindingSameApp.vk, g_settings.bindingSameApp.modifiers);
-    Wh_Log(L"[CustomShortcuts]   Fullscreen: '%s' (valid=%d)",
-           g_settings.bindingToggleFullscreen.originalStr.c_str(), g_settings.bindingToggleFullscreen.valid);
 }
 
 // Windhawk mod initialization
