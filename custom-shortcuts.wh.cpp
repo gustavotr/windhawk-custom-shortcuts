@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              custom-shortcuts
 // @name            Custom Shortcuts
-// @description     Customizable keyboard shortcuts inspired by KDE on Linux, including same-app window switching with Alt+`, terminal launcher, and window management
-// @version         1.4.0
+// @description     Customizable keyboard shortcuts inspired by Linux, including same-app window switching with Alt+`, custom application launchers, and window management
+// @version         1.5.0
 // @author          Gustavo Rudiger
 // @github          https://github.com/gustavotr
 // @include         explorer.exe
@@ -14,7 +14,7 @@
 /*
 # Custom Shortcuts
 
-A Windhawk mod that brings productive, Linux and KDE Plasma-inspired keyboard shortcuts to Windows, with **fully customizable key combinations** for every action.
+A Windhawk mod that brings productive keyboard shortcuts to Windows, with **fully customizable key combinations** for every action.
 
 ## Configurable Keybindings
 
@@ -23,10 +23,7 @@ You can customize the key combination for every single action in the mod setting
 | Action | Default Combination | Description |
 | :--- | :--- | :--- |
 | **Same-App Window Switcher** | `Alt + \`` | Cycle through open windows of the currently active application with a clean HUD preview. |
-| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (defaults to `cmd.exe`). |
-| **Terminal Launcher (Primary)** | `Win + T` | Quickly launch your preferred terminal emulator (defaults to Windows Terminal `wt.exe`). |
-| **Terminal Launcher (Secondary)**| `Ctrl + Alt + T` | Standard Linux shortcut to launch the terminal emulator. |
-| **Close Active Window** | `Win + Q` | Closes the currently active window gracefully (`WM_CLOSE`), KDE Plasma-style. |
+| **Custom App Launchers** | `Win + Enter` | Launch any configured application or command (e.g. `cmd.exe`, `wsl -- cd ~`). |
 | **Toggle Fullscreen / Maximize**| `Win + F` | Toggles maximize / restore on the active window. |
 | **Virtual Desktop Navigation** | `Win + 1 ... 9` | Direct switching to virtual desktop 1 through 9. |
 
@@ -68,18 +65,6 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
       $name: Custom App 3 Shortcut
       $description: >-
         Key combination to launch Custom Application 3. Leave empty to disable.
-    - hotkeyTerminalWinT: "Win+T"
-      $name: Terminal Shortcut (Primary)
-      $description: >-
-        Key combination to launch terminal (e.g. Win+T). Leave empty to disable.
-    - hotkeyTerminalCtrlAltT: "Ctrl+Alt+T"
-      $name: Terminal Shortcut (Secondary)
-      $description: >-
-        Secondary shortcut to launch terminal (e.g. Ctrl+Alt+T). Leave empty to disable.
-    - hotkeyCloseWindow: "Win+Q"
-      $name: Close Active Window
-      $description: >-
-        Key combination to close active window (e.g. Win+Q, Alt+Q, Win+W). Leave empty to disable.
     - hotkeyToggleFullscreen: "Win+F"
       $name: Toggle Fullscreen / Maximize
       $description: >-
@@ -103,10 +88,6 @@ Key combinations are specified in the format `Modifier+Key` or `Modifier+Modifie
     - customAppArgs3: ""
       $name: Custom App 3 Arguments
       $description: Optional command line arguments for Custom Application 3.
-- terminalOptions:
-    - terminalPath: "wt.exe"
-      $name: Terminal Executable Path
-      $description: Path or executable name to launch (e.g. wt.exe, powershell.exe, cmd.exe).
 - hudOptions:
     - showHud: true
       $name: Show HUD preview
@@ -159,14 +140,10 @@ struct CustomAppShortcut {
 // Mod settings structure
 struct ModSettings {
     HotkeyBinding bindingSameApp;
-    HotkeyBinding bindingTerminalWinT;
-    HotkeyBinding bindingTerminalCtrlAltT;
-    HotkeyBinding bindingCloseWindow;
     HotkeyBinding bindingToggleFullscreen;
 
     std::vector<CustomAppShortcut> customApps;
 
-    std::wstring terminalPath = L"wt.exe";
     bool showHud = true;
     std::wstring hudTheme = L"dark";
     bool enableDirectSwitching = true;
@@ -1146,35 +1123,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
     }
 
-    // 3. Terminal Launchers (Primary and Secondary)
-    if (isKeyDown && !g_settings.terminalPath.empty()) {
-        if (g_settings.bindingTerminalWinT.Matches(activeModifiers, pKey->vkCode) ||
-            g_settings.bindingTerminalCtrlAltT.Matches(activeModifiers, pKey->vkCode)) {
-            Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Terminal Launcher! Launching: %s",
-                   g_settings.terminalPath.c_str());
-            if (activeModifiers & MOD_WIN) {
-                keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
-            }
-            LaunchApplication(g_settings.terminalPath, L"");
-            return 1;
-        }
-    }
-
-    // 4. Close Active Window
-    if (isKeyDown && g_settings.bindingCloseWindow.Matches(activeModifiers, pKey->vkCode)) {
-        Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Close Active Window! (%s)",
-               g_settings.bindingCloseWindow.originalStr.c_str());
-        if (activeModifiers & MOD_WIN) {
-            keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0); // suppress Start Menu
-        }
-        HWND hForeground = GetForegroundWindow();
-        if (hForeground) {
-            PostMessageW(hForeground, WM_CLOSE, 0, 0);
-        }
-        return 1;
-    }
-
-    // 5. Toggle Fullscreen / Maximize
+    // 3. Toggle Fullscreen / Maximize
     if (isKeyDown && g_settings.bindingToggleFullscreen.Matches(activeModifiers, pKey->vkCode)) {
         Wh_Log(L"[CustomShortcuts] >>> TRIGGERED Toggle Fullscreen/Maximize! (%s)",
                g_settings.bindingToggleFullscreen.originalStr.c_str());
@@ -1278,20 +1227,8 @@ static void LoadModSettings() {
     LPCWSTR sameAppStr = Wh_GetStringSetting(L"shortcuts.hotkeySameApp");
     ParseHotkeyString((sameAppStr && *sameAppStr) ? sameAppStr : L"Alt+`", g_settings.bindingSameApp);
 
-    LPCWSTR termWinStr = Wh_GetStringSetting(L"shortcuts.hotkeyTerminalWinT");
-    ParseHotkeyString((termWinStr && *termWinStr) ? termWinStr : L"Win+T", g_settings.bindingTerminalWinT);
-
-    LPCWSTR termCtrlAltStr = Wh_GetStringSetting(L"shortcuts.hotkeyTerminalCtrlAltT");
-    ParseHotkeyString((termCtrlAltStr && *termCtrlAltStr) ? termCtrlAltStr : L"Ctrl+Alt+T", g_settings.bindingTerminalCtrlAltT);
-
-    LPCWSTR closeStr = Wh_GetStringSetting(L"shortcuts.hotkeyCloseWindow");
-    ParseHotkeyString((closeStr && *closeStr) ? closeStr : L"Win+Q", g_settings.bindingCloseWindow);
-
     LPCWSTR fsStr = Wh_GetStringSetting(L"shortcuts.hotkeyToggleFullscreen");
     ParseHotkeyString((fsStr && *fsStr) ? fsStr : L"Win+F", g_settings.bindingToggleFullscreen);
-
-    LPCWSTR termPath = Wh_GetStringSetting(L"terminalOptions.terminalPath");
-    g_settings.terminalPath = (termPath && *termPath) ? termPath : L"wt.exe";
 
     g_settings.showHud = Wh_GetIntSetting(L"hudOptions.showHud") != 0;
 
@@ -1342,12 +1279,6 @@ static void LoadModSettings() {
     Wh_Log(L"[CustomShortcuts]   Same-App: '%s' (valid=%d, vk=0x%02X, mods=0x%X)",
            g_settings.bindingSameApp.originalStr.c_str(), g_settings.bindingSameApp.valid,
            g_settings.bindingSameApp.vk, g_settings.bindingSameApp.modifiers);
-    Wh_Log(L"[CustomShortcuts]   Terminal 1: '%s' (valid=%d)",
-           g_settings.bindingTerminalWinT.originalStr.c_str(), g_settings.bindingTerminalWinT.valid);
-    Wh_Log(L"[CustomShortcuts]   Terminal 2: '%s' (valid=%d)",
-           g_settings.bindingTerminalCtrlAltT.originalStr.c_str(), g_settings.bindingTerminalCtrlAltT.valid);
-    Wh_Log(L"[CustomShortcuts]   Close Win: '%s' (valid=%d)",
-           g_settings.bindingCloseWindow.originalStr.c_str(), g_settings.bindingCloseWindow.valid);
     Wh_Log(L"[CustomShortcuts]   Fullscreen: '%s' (valid=%d)",
            g_settings.bindingToggleFullscreen.originalStr.c_str(), g_settings.bindingToggleFullscreen.valid);
 }
